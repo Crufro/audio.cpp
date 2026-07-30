@@ -58,6 +58,7 @@ runtime::ModelCliInterface cli(const Qwen3TTSAssets &) {
         {"qwen3_tts.mem_saver", "true|false", "Release the talker cached-step graph after each request; default false."},
         {"qwen3_tts.perf_mode", "off|flash_attention", "Q8_0-only attention performance mode; default off keeps the exact-safe path."},
         {"qwen3_tts.voice_prompt_cache_slots", "n", "Voice prompt cache slots; default 1."},
+        {"prepare_voice_prompt_only", "true|false", "Build/cache a Base voice prompt without synthesizing audio."},
     };
     return out;
 }

@@ -524,9 +524,6 @@ PromptEmbeddingState build_prompt_state(
     if (!prefill.speaker_embedding.has_value() || prefill.speaker_embedding->dims != config.hidden_size) {
         throw std::runtime_error("Qwen3 talker voice clone prefill requires speaker embedding");
     }
-    if (!prefill.reference_codes.has_value() || prefill.reference_ids.empty()) {
-        throw std::runtime_error("Qwen3 talker ICL prefill requires reference ids and codes");
-    }
 
     PromptEmbeddingState state;
     state.tts_pad = tts_pad;
@@ -549,6 +546,34 @@ PromptEmbeddingState build_prompt_state(
     append_row(state.prompt, add_rows(tts_bos, row_at(codec_embed, codec_rows - 2, config.hidden_size)));
 
     const std::vector<int32_t> text_ids(prefill.input_ids.begin() + 3, prefill.input_ids.end() - 5);
+    if (prefill.x_vector_only_mode) {
+        auto text_embed = text_project_host(
+            lookup_rows(weights.text_embedding, config.text_hidden_size, text_ids),
+            static_cast<int64_t>(text_ids.size()),
+            weights,
+            config);
+        append_row(text_embed, tts_eos);
+        append_rows(
+            state.prompt,
+            add_rows(
+                text_embed,
+                lookup_rows(
+                    weights.codec_embedding,
+                    config.hidden_size,
+                    std::vector<int32_t>(
+                        text_ids.size() + 1,
+                        static_cast<int32_t>(config.codec_pad_id)))));
+        append_row(
+            state.prompt,
+            add_rows(
+                tts_pad,
+                row_at(codec_embed, codec_rows - 1, config.hidden_size)));
+        state.trailing_text = tts_pad;
+        return state;
+    }
+    if (!prefill.reference_codes.has_value() || prefill.reference_ids.empty()) {
+        throw std::runtime_error("Qwen3 talker ICL prefill requires reference ids and codes");
+    }
     const std::vector<int32_t> ref_text_ids(prefill.reference_ids.begin() + 3, prefill.reference_ids.end() - 2);
     std::vector<int32_t> combined_text = ref_text_ids;
     combined_text.insert(combined_text.end(), text_ids.begin(), text_ids.end());

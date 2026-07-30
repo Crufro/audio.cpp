@@ -431,6 +431,25 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
         *speech_encoder_,
         *speaker_encoder_,
         assets_->config.talker.max_position_embeddings);
+    bool prepare_voice_prompt_only = false;
+    if (const auto value = runtime::find_option(
+            request.options,
+            {"prepare_voice_prompt_only"})) {
+        prepare_voice_prompt_only =
+            runtime::parse_bool_option(*value, "prepare_voice_prompt_only");
+    }
+    if (prepare_voice_prompt_only) {
+        const auto prompt_start = Clock::now();
+        (void) resolve_voice_prompt(*first_request.voice_clone, prompt_builder);
+        runtime::TaskResult result;
+        debug::timing_log_scalar(
+            "qwen3_tts.voice_prompt_ms",
+            engine::debug::elapsed_ms(prompt_start, Clock::now()));
+        debug::timing_log_scalar(
+            "session.wall_ms",
+            engine::debug::elapsed_ms(wall_start, Clock::now()));
+        return result;
+    }
     double prompt_ms = 0.0;
     double prefill_ms = 0.0;
     double talker_ms = 0.0;
@@ -444,9 +463,6 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
         const auto prefill_start = Clock::now();
         const auto prefill = prompt_builder.build_prefill(qwen_request, voice_prompt);
         prefill_ms += engine::debug::elapsed_ms(prefill_start, Clock::now());
-        if (!voice_prompt.reference_codes.has_value()) {
-            throw std::runtime_error("Qwen3 base TTS talker currently requires ICL reference codes");
-        }
         const auto talker_start = Clock::now();
         const auto codes = talker_step_->generate(
             prefill,
@@ -454,11 +470,17 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
             qwen_request.generation.repetition_penalty);
         talker_ms += engine::debug::elapsed_ms(talker_start, Clock::now());
         const auto decoder_start = Clock::now();
-        runtime::append_audio_buffer(
-            merged_audio,
-            speech_decoder_->decode_and_trim_reference(
-                *voice_prompt.reference_codes,
-                codes.generated_codes));
+        if (voice_prompt.reference_codes.has_value()) {
+            runtime::append_audio_buffer(
+                merged_audio,
+                speech_decoder_->decode_and_trim_reference(
+                    *voice_prompt.reference_codes,
+                    codes.generated_codes));
+        } else {
+            runtime::append_audio_buffer(
+                merged_audio,
+                speech_decoder_->decode(codes.generated_codes));
+        }
         decoder_ms += engine::debug::elapsed_ms(decoder_start, Clock::now());
     }
     release_talker_cached_step_graph();
