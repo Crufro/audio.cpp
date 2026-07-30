@@ -22,7 +22,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <memory>
 #include <unordered_map>
 #include <stdexcept>
 #include <string>
@@ -350,7 +352,9 @@ public:
         ggml_backend_t backend,
         int threads,
         const std::filesystem::path & manifest_path)
-        : backend_(backend) {
+        : backend_(backend),
+          assets_config_(assets.config.decoder),
+          threads_(threads) {
         if (manifest_path.empty()) {
             return;
         }
@@ -364,7 +368,29 @@ public:
             throw std::runtime_error("VibeVoice runtime LoRA manifest requires at least one adapter");
         }
 
-        active_ = make_zero_resident(assets.config.decoder, threads, "vibevoice.runtime_lora.active");
+        const std::string residency =
+            engine::io::json::optional_string(root, "residency", "gpu");
+        if (residency != "gpu" && residency != "host_lru") {
+            throw std::runtime_error(
+                "VibeVoice runtime LoRA manifest residency must be gpu or host_lru");
+        }
+        host_lru_ = residency == "host_lru";
+        gpu_cache_slots_ = engine::io::json::optional_i64(
+            root, "gpu_cache_slots", host_lru_ ? 4 : 0);
+        if (gpu_cache_slots_ < 0) {
+            throw std::runtime_error(
+                "VibeVoice runtime LoRA manifest gpu_cache_slots must be non-negative");
+        }
+        if (host_lru_) {
+            cpu_backend_ = core::init_backend(
+                core::BackendConfig{core::BackendType::Cpu, 0, threads});
+        }
+
+        active_ = make_zero_resident(
+            assets.config.decoder,
+            backend_,
+            threads,
+            "vibevoice.runtime_lora.active");
         for (const auto & [id, path_value] : adapters) {
             if (id.empty()) {
                 throw std::runtime_error("VibeVoice runtime LoRA adapter id must not be empty");
@@ -383,6 +409,7 @@ public:
                 make_resident(
                     assets.config.decoder,
                     data,
+                    host_lru_ ? cpu_backend_ : backend_,
                     threads,
                     "vibevoice.runtime_lora." + id));
             if (!inserted) {
@@ -392,6 +419,17 @@ public:
         }
         engine::debug::timing_log_scalar("vibevoice.runtime_lora.adapters", adapters_.size());
         engine::debug::timing_log_scalar("vibevoice.runtime_lora.max_rank", max_rank_);
+        engine::debug::timing_log_scalar(
+            "vibevoice.runtime_lora.gpu_cache_slots", gpu_cache_slots_);
+    }
+
+    ~VibeVoiceRuntimeLoraStore() {
+        gpu_cache_.clear();
+        adapters_.clear();
+        active_.reset();
+        if (cpu_backend_ != nullptr) {
+            ggml_backend_free(cpu_backend_);
+        }
     }
 
     bool enabled() const noexcept {
@@ -423,7 +461,11 @@ public:
             if (it == adapters_.end()) {
                 throw std::runtime_error("unknown VibeVoice runtime LoRA adapter id: " + id);
             }
-            copy_resident(it->second, *active_);
+            if (host_lru_) {
+                copy_resident(require_cached(id, it->second), *active_);
+            } else {
+                copy_resident(it->second, *active_);
+            }
         }
         ggml_backend_synchronize(backend_);
         active_id_ = id;
@@ -441,6 +483,12 @@ private:
     struct Resident {
         std::unique_ptr<core::ConstantTensorCache> cache;
         std::vector<VibeVoiceDecoderLoraLayerWeights> layers;
+    };
+
+    struct CacheSlot {
+        std::string id;
+        std::unique_ptr<Resident> resident;
+        uint64_t last_used = 0;
     };
 
     using DeltaMap = std::unordered_map<std::string, const VibeVoiceLoraTensorDelta *>;
@@ -532,11 +580,12 @@ private:
 
     std::unique_ptr<Resident> make_zero_resident(
         const VibeVoiceDecoderConfig & config,
+        ggml_backend_t target_backend,
         int threads,
         const std::string & name) const {
         auto out = std::make_unique<Resident>();
         out->cache = std::make_unique<core::ConstantTensorCache>(
-            backend_, threads, name, 64ull * 1024ull * 1024ull);
+            target_backend, threads, name, 64ull * 1024ull * 1024ull);
         out->layers.reserve(static_cast<size_t>(config.num_hidden_layers));
         for (int64_t layer = 0; layer < config.num_hidden_layers; ++layer) {
             (void) layer;
@@ -563,6 +612,7 @@ private:
     std::unique_ptr<Resident> make_resident(
         const VibeVoiceDecoderConfig & config,
         const VibeVoiceLoraAdapterData & data,
+        ggml_backend_t target_backend,
         int threads,
         const std::string & name) const {
         DeltaMap deltas;
@@ -572,7 +622,7 @@ private:
         }
         auto out = std::make_unique<Resident>();
         out->cache = std::make_unique<core::ConstantTensorCache>(
-            backend_, threads, name, 64ull * 1024ull * 1024ull);
+            target_backend, threads, name, 64ull * 1024ull * 1024ull);
         out->layers.reserve(static_cast<size_t>(config.num_hidden_layers));
         for (int64_t layer = 0; layer < config.num_hidden_layers; ++layer) {
             const std::string prefix = "model.language_model.layers." + std::to_string(layer);
@@ -629,6 +679,49 @@ private:
         }
     }
 
+    const std::unique_ptr<Resident> & require_cached(
+        const std::string & id,
+        const std::unique_ptr<Resident> & host) {
+        ++cache_clock_;
+        for (auto & slot : gpu_cache_) {
+            if (slot.id == id) {
+                slot.last_used = cache_clock_;
+                ++cache_hits_;
+                engine::debug::timing_log_scalar(
+                    "vibevoice.runtime_lora.cache_hit", 1);
+                return slot.resident;
+            }
+        }
+        ++cache_misses_;
+        engine::debug::timing_log_scalar("vibevoice.runtime_lora.cache_hit", 0);
+        if (gpu_cache_slots_ == 0) {
+            return host;
+        }
+        CacheSlot * selected = nullptr;
+        if (gpu_cache_.size() < static_cast<size_t>(gpu_cache_slots_)) {
+            CacheSlot slot;
+            slot.resident = make_zero_resident(
+                assets_config_,
+                backend_,
+                threads_,
+                "vibevoice.runtime_lora.cache." + std::to_string(gpu_cache_.size()));
+            gpu_cache_.push_back(std::move(slot));
+            selected = &gpu_cache_.back();
+        } else {
+            selected = &*std::min_element(
+                gpu_cache_.begin(),
+                gpu_cache_.end(),
+                [](const CacheSlot & lhs, const CacheSlot & rhs) {
+                    return lhs.last_used < rhs.last_used;
+                });
+        }
+        copy_resident(host, *selected->resident);
+        ggml_backend_synchronize(backend_);
+        selected->id = id;
+        selected->last_used = cache_clock_;
+        return selected->resident;
+    }
+
     void clear_active() {
         for (const auto & layer : active_->layers) {
             ggml_backend_tensor_memset(layer.q_proj.a.tensor, 0, 0, ggml_nbytes(layer.q_proj.a.tensor));
@@ -649,9 +742,18 @@ private:
     }
 
     ggml_backend_t backend_ = nullptr;
+    ggml_backend_t cpu_backend_ = nullptr;
+    VibeVoiceDecoderConfig assets_config_;
+    int threads_ = 1;
     int64_t max_rank_ = 0;
+    bool host_lru_ = false;
+    int64_t gpu_cache_slots_ = 0;
+    uint64_t cache_clock_ = 0;
+    uint64_t cache_hits_ = 0;
+    uint64_t cache_misses_ = 0;
     std::unique_ptr<Resident> active_;
     std::unordered_map<std::string, std::unique_ptr<Resident>> adapters_;
+    std::vector<CacheSlot> gpu_cache_;
     std::string active_id_;
 };
 

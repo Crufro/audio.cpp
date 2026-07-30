@@ -599,7 +599,11 @@ audiocpp_cli --task tts --family vibevoice --model models/VibeVoice-1.5B --backe
 
 The adapter follows the PEFT training layout: `adapter_model.safetensors` + `adapter_config.json` for the language-model LoRA, plus optional `diffusion_head/model.safetensors` (or `diffusion_head_full.bin`), `acoustic_connector/pytorch_model.bin`, and `semantic_connector/pytorch_model.bin` for the fully fine-tuned components. Everything is applied at load time, so it composes with the `vibevoice.*_weight_type` quantization options and adds no per-step cost; the overlay is logged with `--log`. Use a 1.5B adapter with `VibeVoice-1.5B` and a 7B adapter with `VibeVoice-7B`; a size mismatch is rejected with a descriptive error. The same option may instead be passed as `--session-option vibevoice.lora` (but not via both at once).
 
-Runtime LoRA manifests use `{"max_rank":128,"adapters":{"voice_id":"/path/to/adapter"}}`.
+Runtime LoRA manifests use
+`{"max_rank":128,"adapters":{"voice_id":"/path/to/adapter"}}`. The optional
+`"residency":"host_lru"` mode keeps the full adapter roster in host memory and
+uses `"gpu_cache_slots":4` recent GPU copies plus the stable active slot;
+`"residency":"gpu"` remains the default.
 The runtime path supports decoder PEFT A/B tensors only, converts them to fp16, pads
 smaller ranks to `max_rank`, and folds each adapter's configured scale into B. All
 listed adapters plus one active slot remain on the selected backend. Full diffusion
