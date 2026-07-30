@@ -7,6 +7,7 @@
 #include "engine/models/vibevoice/decoder.h"
 #include "engine/models/vibevoice/diffusion_head.h"
 #include "engine/models/vibevoice/generator.h"
+#include "engine/models/vibevoice/lora.h"
 #include "engine/models/vibevoice/session.h"
 #include "engine/models/vibevoice/tokenizer_audio.h"
 #include "engine/models/vibevoice/tokenizer_text.h"
@@ -20,6 +21,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -83,15 +85,15 @@ std::string required_string(const engine::io::json::Value & object, const std::s
 
 std::vector<std::string> required_string_array(const engine::io::json::Value & object, const std::string & key) {
     const auto * value = object.find(key);
-    if (value == nullptr || !value->is_array()) {
-        throw std::runtime_error("VibeVoice warmbench request missing required array field: " + key);
+    if (value == nullptr) {
+        return {};
+    }
+    if (!value->is_array()) {
+        throw std::runtime_error("VibeVoice warmbench request field must be an array: " + key);
     }
     std::vector<std::string> out;
     for (const auto & item : value->as_array()) {
         out.push_back(item.as_string());
-    }
-    if (out.empty()) {
-        throw std::runtime_error("VibeVoice warmbench request voice_samples must not be empty");
     }
     return out;
 }
@@ -111,15 +113,15 @@ engine::models::vibevoice::VibeVoiceRequest make_request(
     const std::string & noise_file) {
     engine::models::vibevoice::VibeVoiceRequest request;
     request.text = required_string(object, "text");
-    request.generation.ddpm_inference_steps = assets.config.diffusion_head.ddpm_num_inference_steps;
-    request.generation.max_new_tokens =
-        engine::io::json::optional_i64(object, "max_new_tokens", request.generation.max_new_tokens);
+    request.generation.num_inference_steps = assets.config.diffusion_head.ddpm_num_inference_steps;
+    request.generation.max_tokens =
+        engine::io::json::optional_i64(object, "max_new_tokens", request.generation.max_tokens);
     request.generation.max_length_times =
         engine::io::json::optional_f32(object, "max_length_times", request.generation.max_length_times);
-    request.generation.ddpm_inference_steps =
-        engine::io::json::optional_i64(object, "ddpm_steps", request.generation.ddpm_inference_steps);
-    request.generation.cfg_scale =
-        engine::io::json::optional_f32(object, "cfg_scale", request.generation.cfg_scale);
+    request.generation.num_inference_steps =
+        engine::io::json::optional_i64(object, "ddpm_steps", request.generation.num_inference_steps);
+    request.generation.guidance_scale =
+        engine::io::json::optional_f32(object, "cfg_scale", request.generation.guidance_scale);
     request.generation.do_sample =
         engine::io::json::optional_bool(object, "do_sample", request.generation.do_sample);
     request.generation.temperature =
@@ -136,16 +138,16 @@ engine::models::vibevoice::VibeVoiceRequest make_request(
     request.generation.diffusion_noise_file = noise_file.empty()
         ? optional_string(object, "diffusion_noise_file")
         : noise_file;
-    if (request.generation.max_new_tokens < 0) {
+    if (request.generation.max_tokens < 0) {
         throw std::runtime_error("VibeVoice warmbench max_new_tokens must be non-negative");
     }
     if (request.generation.max_length_times <= 0.0F) {
         throw std::runtime_error("VibeVoice warmbench max_length_times must be positive");
     }
-    if (request.generation.ddpm_inference_steps <= 0) {
+    if (request.generation.num_inference_steps <= 0) {
         throw std::runtime_error("VibeVoice warmbench ddpm_steps must be positive");
     }
-    if (request.generation.cfg_scale < 0.0F) {
+    if (request.generation.guidance_scale < 0.0F) {
         throw std::runtime_error("VibeVoice warmbench cfg_scale must be non-negative");
     }
     if (request.generation.temperature <= 0.0F) {
@@ -210,11 +212,14 @@ engine::runtime::TaskRequest make_task_request(
     const std::string & noise_file) {
     engine::runtime::TaskRequest request;
     request.text_input = engine::runtime::Transcript{required_string(object, "text"), ""};
-    request.options["voice_samples"] = join_voice_samples(required_string_array(object, "voice_samples"));
-    set_optional_i64_option(request, object, "max_new_tokens", "max_new_tokens");
+    const auto voice_samples = required_string_array(object, "voice_samples");
+    if (!voice_samples.empty()) {
+        request.options["voice_samples"] = join_voice_samples(voice_samples);
+    }
+    set_optional_i64_option(request, object, "max_new_tokens", "max_tokens");
     set_optional_f32_option(request, object, "max_length_times", "max_length_times");
-    set_optional_i64_option(request, object, "ddpm_steps", "ddpm_steps");
-    set_optional_f32_option(request, object, "cfg_scale", "cfg_scale");
+    set_optional_i64_option(request, object, "ddpm_steps", "num_inference_steps");
+    set_optional_f32_option(request, object, "cfg_scale", "guidance_scale");
     set_optional_bool_option(request, object, "do_sample", "do_sample");
     set_optional_f32_option(request, object, "temperature", "temperature");
     set_optional_i64_option(request, object, "top_k", "top_k");
@@ -386,6 +391,8 @@ int main(int argc, char ** argv) {
         const std::string prompt_noise_file = arg_value(argc, argv, "--prompt-noise-file", "");
         const std::string noise_file = arg_value(argc, argv, "--noise-file", "");
         const std::string log_file = arg_value(argc, argv, "--log-file", "");
+        const std::string lora_path = arg_value(argc, argv, "--lora", "");
+        const std::string weight_type = arg_value(argc, argv, "--weight-type", "");
         const bool batch = has_arg(argc, argv, "--batch");
         const std::filesystem::path output_dir = arg_value(argc, argv, "--output-dir", "");
         const std::filesystem::path timing_path =
@@ -413,8 +420,16 @@ int main(int argc, char ** argv) {
         set_env_required("MINITTS_TIMING_ENABLED", "1");
         set_env_required("MINITTS_TIMING_FILE", timing_path.string());
 
+        const auto initialization_started = std::chrono::steady_clock::now();
+        double initialization_ms = 0.0;
         const auto backend = parse_backend(backend_name);
         auto assets = engine::models::vibevoice::load_vibevoice_assets(model_path);
+        std::unordered_map<std::string, std::string> fine_tune_options;
+        if (!lora_path.empty()) {
+            fine_tune_options["vibevoice.lora"] = lora_path;
+        }
+        assets = engine::models::vibevoice::apply_vibevoice_finetune_options(
+            std::move(assets), fine_tune_options);
 
         if (!output_dir.empty()) {
             std::filesystem::create_directories(output_dir);
@@ -427,6 +442,8 @@ int main(int argc, char ** argv) {
             engine::models::vibevoice::VibeVoiceConnectorWeightsRuntime connector(assets, backend, device, threads);
             engine::models::vibevoice::VibeVoiceDecoderWeightsRuntime decoder(assets, backend, device, threads);
             engine::models::vibevoice::VibeVoiceDiffusionHeadWeightsRuntime diffusion_head(assets, backend, device, threads);
+            initialization_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - initialization_started).count();
             const auto requests = parse_requests(request_sequence_json, *assets, prompt_noise_file, noise_file);
             steps.reserve(requests.size());
             for (int i = 0; i < warmup; ++i) {
@@ -475,6 +492,9 @@ int main(int argc, char ** argv) {
             options.backend.type = backend;
             options.backend.device = device;
             options.backend.threads = threads;
+            if (!weight_type.empty()) {
+                options.options["vibevoice.weight_type"] = weight_type;
+            }
             engine::models::vibevoice::VibeVoiceSession session(
                 {engine::runtime::VoiceTaskKind::Tts, engine::runtime::RunMode::Offline},
                 options,
@@ -482,6 +502,8 @@ int main(int argc, char ** argv) {
             const auto requests = parse_task_requests(request_sequence_json, prompt_noise_file, noise_file);
             steps.reserve(requests.size());
             session.prepare(engine::runtime::build_preparation_request(requests.front()));
+            initialization_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - initialization_started).count();
             for (int i = 0; i < warmup; ++i) {
                 (void) session.run(requests.front());
             }
@@ -516,6 +538,7 @@ int main(int argc, char ** argv) {
         const auto summary = engine::io::json::Value::make_object({
             {"family", string("vibevoice")},
             {"backend", string(backend_name)},
+            {"initialization_ms", number(initialization_ms)},
             {"sequence_steps", engine::io::json::Value::make_array(std::move(steps))},
         });
         std::cout << "summary_json=" << engine::io::json::stringify(summary) << "\n";
