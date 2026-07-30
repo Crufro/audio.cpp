@@ -44,11 +44,14 @@ runtime::ModelCliInterface cli(const VibeVoiceAssets &) {
         {"vibevoice.connector_weight_type", "native|f32|f16|bf16|q8_0", "Acoustic and semantic connector weight storage type."},
         {"vibevoice.decoder_weight_type", "native|f32|f16|bf16|q8_0", "Language decoder weight storage type."},
         {"vibevoice.diffusion_head_weight_type", "native|f32|f16|bf16|q8_0", "Diffusion prediction head weight storage type."},
+        {"vibevoice.runtime_lora_manifest", "path", "Runtime decoder-LoRA manifest; keeps listed adapters resident."},
     };
     out.load_options = {
         {"vibevoice.lora", "path", "Fine-tune adapter dir (LM LoRA + diffusion head + acoustic/semantic connectors) merged at load time."},
         {"vibevoice.lora_scale", "float", "LoRA merge scale override; defaults to lora_alpha / r."},
     };
+    out.request_options.push_back(
+        {"vibevoice.adapter_id", "id", "Activate a resident runtime LoRA adapter; omit for the base-only slot."});
     return out;
 }
 

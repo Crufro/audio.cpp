@@ -391,6 +391,7 @@ int main(int argc, char ** argv) {
         const int threads = int_arg(argc, argv, "--threads", 8);
         const int warmup = int_arg(argc, argv, "--warmup", 0);
         const int iterations = int_arg(argc, argv, "--iterations", 1);
+        const int sequence_repeats = int_arg(argc, argv, "--sequence-repeats", 1);
         const std::string request_sequence_json = arg_value(argc, argv, "--request-sequence-json", "");
         const std::string prompt_noise_file = arg_value(argc, argv, "--prompt-noise-file", "");
         const std::string noise_file = arg_value(argc, argv, "--noise-file", "");
@@ -398,6 +399,8 @@ int main(int argc, char ** argv) {
         const std::string lora_path = arg_value(argc, argv, "--lora", "");
         const std::string runtime_lora_manifest =
             arg_value(argc, argv, "--runtime-lora-manifest", "");
+        const std::string runtime_lora_adapter =
+            arg_value(argc, argv, "--runtime-lora-adapter", "");
         const std::string weight_type = arg_value(argc, argv, "--weight-type", "");
         const bool batch = has_arg(argc, argv, "--batch");
         const std::filesystem::path output_dir = arg_value(argc, argv, "--output-dir", "");
@@ -508,7 +511,22 @@ int main(int argc, char ** argv) {
                 {engine::runtime::VoiceTaskKind::Tts, engine::runtime::RunMode::Offline},
                 options,
                 assets);
-            const auto requests = parse_task_requests(request_sequence_json, prompt_noise_file, noise_file);
+            auto requests = parse_task_requests(request_sequence_json, prompt_noise_file, noise_file);
+            if (!runtime_lora_adapter.empty()) {
+                for (auto & request : requests) {
+                    if (request.options.find("vibevoice.adapter_id") == request.options.end()) {
+                        request.options["vibevoice.adapter_id"] = runtime_lora_adapter;
+                    }
+                }
+            }
+            if (sequence_repeats > 1) {
+                const auto original = requests;
+                requests.clear();
+                requests.reserve(original.size() * static_cast<size_t>(sequence_repeats));
+                for (int repeat = 0; repeat < sequence_repeats; ++repeat) {
+                    requests.insert(requests.end(), original.begin(), original.end());
+                }
+            }
             steps.reserve(requests.size());
             session.prepare(engine::runtime::build_preparation_request(requests.front()));
             initialization_ms = std::chrono::duration<double, std::milli>(

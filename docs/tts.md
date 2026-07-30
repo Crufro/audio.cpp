@@ -595,7 +595,16 @@ audiocpp_cli --task tts --family vibevoice --model models/VibeVoice-1.5B --backe
 | `--top-p` | float | `1.0` | Decoder nucleus sampling limit. |
 | `--load-option vibevoice.lora=<path>` | fine-tune adapter dir | not set | Overlay a fine-tune at load time: the language-model LoRA is delta-merged into the decoder linears, and the diffusion head and acoustic/semantic connectors (when present in the adapter dir) replace their base tensors. Dims must match the base model size. |
 | `--load-option vibevoice.lora_scale=<float>` | float | `lora_alpha / r` | Override the LoRA merge scale from `adapter_config.json`. |
+| `--session-option vibevoice.runtime_lora_manifest=<path>` | JSON manifest path | not set | Keep decoder-only PEFT adapters resident separately from one immutable base model. Select an adapter per request with `vibevoice.adapter_id`. Runtime and merged LoRA modes are mutually exclusive. |
 
 The adapter follows the PEFT training layout: `adapter_model.safetensors` + `adapter_config.json` for the language-model LoRA, plus optional `diffusion_head/model.safetensors` (or `diffusion_head_full.bin`), `acoustic_connector/pytorch_model.bin`, and `semantic_connector/pytorch_model.bin` for the fully fine-tuned components. Everything is applied at load time, so it composes with the `vibevoice.*_weight_type` quantization options and adds no per-step cost; the overlay is logged with `--log`. Use a 1.5B adapter with `VibeVoice-1.5B` and a 7B adapter with `VibeVoice-7B`; a size mismatch is rejected with a descriptive error. The same option may instead be passed as `--session-option vibevoice.lora` (but not via both at once).
+
+Runtime LoRA manifests use `{"max_rank":128,"adapters":{"voice_id":"/path/to/adapter"}}`.
+The runtime path supports decoder PEFT A/B tensors only, converts them to fp16, pads
+smaller ranks to `max_rank`, and folds each adapter's configured scale into B. All
+listed adapters plus one active slot remain on the selected backend. Full diffusion
+head or connector overrides and runtime blends are rejected. Request option
+`vibevoice.adapter_id=voice_id` activates a listed adapter; omitting it selects the
+zeroed base-only slot.
 
 For backend weight-type controls, use `audiocpp_cli --inspect --model <model-dir> --family <family>`.
