@@ -32,6 +32,26 @@ std::shared_ptr<const VibeVoiceAssets> require_assets(std::shared_ptr<const Vibe
     return assets;
 }
 
+std::filesystem::path runtime_lora_manifest(const runtime::SessionOptions & options) {
+    const auto it = options.options.find("vibevoice.runtime_lora_manifest");
+    return it == options.options.end() ? std::filesystem::path{} : std::filesystem::path(it->second);
+}
+
+std::shared_ptr<const VibeVoiceAssets> session_assets(
+    std::shared_ptr<const VibeVoiceAssets> assets,
+    const runtime::SessionOptions & options) {
+    assets = require_assets(std::move(assets));
+    if (!runtime_lora_manifest(options).empty()) {
+        if (options.options.find("vibevoice.lora") != options.options.end() ||
+            options.options.find("vibevoice.lora_scale") != options.options.end()) {
+            throw std::runtime_error(
+                "VibeVoice merged LoRA and runtime LoRA manifest cannot be enabled together");
+        }
+        return assets;
+    }
+    return apply_vibevoice_finetune_options(std::move(assets), options.options);
+}
+
 void validate_weight_storage(engine::assets::TensorStorageType storage_type, const char * option_name) {
     if (storage_type == engine::assets::TensorStorageType::Native ||
         storage_type == engine::assets::TensorStorageType::F32 ||
@@ -57,7 +77,9 @@ const runtime::SessionOptions & require_supported_backend_options(const runtime:
             key == "vibevoice.decoder_weight_type" ||
             key == "vibevoice.diffusion_head_weight_type") {
             validate_weight_storage(engine::assets::parse_tensor_storage_type(value), key.c_str());
-        } else if (key == "vibevoice.lora" || key == "vibevoice.lora_scale") {
+        } else if (key == "vibevoice.lora" ||
+                   key == "vibevoice.lora_scale" ||
+                   key == "vibevoice.runtime_lora_manifest") {
             // Validated where the adapter is loaded.
         } else if (key.rfind("vibevoice.", 0) == 0) {
             throw std::runtime_error("unknown VibeVoice session option: " + key);
@@ -202,7 +224,7 @@ VibeVoiceSession::VibeVoiceSession(
     std::shared_ptr<const VibeVoiceAssets> assets)
     : runtime::RuntimeSessionBase(require_supported_backend_options(options)),
       task_(task),
-      assets_(apply_vibevoice_finetune_options(require_assets(std::move(assets)), options.options)),
+      assets_(session_assets(std::move(assets), options)),
       text_tokenizer_(assets_),
       audio_tokenizer_(
           assets_,
@@ -239,7 +261,8 @@ VibeVoiceSession::VibeVoiceSession(
               ? engine::assets::parse_tensor_storage_type(options.options.at("vibevoice.decoder_weight_type"))
               : (options.options.find("vibevoice.weight_type") != options.options.end()
                       ? engine::assets::parse_tensor_storage_type(options.options.at("vibevoice.weight_type"))
-                      : engine::assets::TensorStorageType::Native)),
+                      : engine::assets::TensorStorageType::Native),
+          runtime_lora_manifest(options)),
       diffusion_head_(
           assets_,
           options.backend.type,
@@ -273,6 +296,9 @@ void VibeVoiceSession::prepare(const runtime::SessionPreparationRequest & reques
 runtime::TaskResult VibeVoiceSession::run(const runtime::TaskRequest & request) {
     require_prepared("VibeVoice run");
     const auto wall_start = Clock::now();
+    const std::string adapter_id =
+        runtime::find_option(request.options, {"vibevoice.adapter_id"}).value_or("");
+    decoder_.activate_runtime_lora(adapter_id);
     auto vibevoice_request = make_request(request);
     auto result = generate_vibevoice(
         vibevoice_request,

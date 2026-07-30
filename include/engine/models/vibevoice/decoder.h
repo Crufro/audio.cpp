@@ -11,8 +11,10 @@
 #include <ggml-backend.h>
 
 #include <cstddef>
+#include <filesystem>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace engine::core {
@@ -29,6 +31,7 @@ class VibeVoiceDecoderPrefillGraph;
 class VibeVoiceDecoderCachedStepGraph;
 class VibeVoiceDecoderCachedBatchStepGraph;
 class VibeVoiceDecoderEmbeddingGraph;
+class VibeVoiceRuntimeLoraStore;
 
 class VibeVoiceDecoderCachedState final {
 public:
@@ -103,6 +106,21 @@ struct VibeVoiceDecoderLayerOutputs {
     core::TensorValue value;
 };
 
+struct VibeVoiceDecoderLoraLinearWeights {
+    core::TensorValue a;
+    core::TensorValue b;
+};
+
+struct VibeVoiceDecoderLoraLayerWeights {
+    VibeVoiceDecoderLoraLinearWeights q_proj;
+    VibeVoiceDecoderLoraLinearWeights k_proj;
+    VibeVoiceDecoderLoraLinearWeights v_proj;
+    VibeVoiceDecoderLoraLinearWeights o_proj;
+    VibeVoiceDecoderLoraLinearWeights gate_proj;
+    VibeVoiceDecoderLoraLinearWeights up_proj;
+    VibeVoiceDecoderLoraLinearWeights down_proj;
+};
+
 class VibeVoiceDecoderWeightsRuntime final {
 public:
     VibeVoiceDecoderWeightsRuntime(
@@ -112,7 +130,8 @@ public:
         int threads,
         size_t weight_context_bytes = 256ull * 1024ull * 1024ull,
         size_t constant_context_bytes = 128ull * 1024ull * 1024ull,
-        assets::TensorStorageType weight_storage_type = assets::TensorStorageType::Native);
+        assets::TensorStorageType weight_storage_type = assets::TensorStorageType::Native,
+        const std::filesystem::path & runtime_lora_manifest = {});
 
     ~VibeVoiceDecoderWeightsRuntime();
 
@@ -124,6 +143,10 @@ public:
     ggml_backend_t backend() const noexcept;
     core::ConstantTensorCache & constants() const noexcept;
     int threads() const noexcept;
+    bool has_runtime_lora() const noexcept;
+    const VibeVoiceDecoderLoraLayerWeights * runtime_lora_layer(size_t layer) const noexcept;
+    double activate_runtime_lora(const std::string & adapter_id);
+    const std::string & active_runtime_lora() const noexcept;
 
     VibeVoiceTokenEmbeddings embed_tokens(const std::vector<int32_t> & input_ids) const;
     VibeVoiceDecoderPrefillOutput prefill_embeddings(const std::vector<float> & embeddings, int64_t steps) const;
@@ -148,6 +171,7 @@ private:
     std::shared_ptr<const VibeVoiceAssets> assets_;
     std::shared_ptr<const VibeVoiceDecoderWeights> weights_;
     std::unique_ptr<core::ConstantTensorCache> constants_;
+    std::unique_ptr<VibeVoiceRuntimeLoraStore> runtime_lora_;
     mutable std::unique_ptr<VibeVoiceDecoderEmbeddingGraph> embedding_graph_;
     mutable std::unique_ptr<VibeVoiceDecoderPrefillGraph> prefill_graph_;
     mutable std::vector<std::unique_ptr<VibeVoiceDecoderCachedBatchStepGraph>> cached_batch_graphs_;
@@ -169,6 +193,7 @@ VibeVoiceDecoderLayerOutputs build_vibevoice_decoder_layer(
     const VibeVoiceDecoderLayerWeights & weights,
     const VibeVoiceDecoderConfig & config,
     core::ConstantTensorCache & constants,
+    const VibeVoiceDecoderLoraLayerWeights * lora = nullptr,
     const std::optional<core::TensorValue> & prefix_key = std::nullopt,
     const std::optional<core::TensorValue> & prefix_value = std::nullopt,
     const std::optional<core::TensorValue> & attention_mask = std::nullopt);
@@ -180,6 +205,7 @@ VibeVoiceDecoderLayerOutputs build_vibevoice_decoder_layer_static_tail(
     const VibeVoiceDecoderLayerWeights & weights,
     const VibeVoiceDecoderConfig & config,
     core::ConstantTensorCache & constants,
+    const VibeVoiceDecoderLoraLayerWeights * lora,
     const core::TensorValue & cache_key,
     const core::TensorValue & cache_value,
     const core::TensorValue & cache_slot,

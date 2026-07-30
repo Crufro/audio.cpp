@@ -7,6 +7,7 @@
 #include "engine/framework/io/json.h"
 #include "engine/framework/runtime/options.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -495,6 +496,69 @@ void add_connector_overrides(
 }
 
 }  // namespace
+
+VibeVoiceLoraAdapterData load_vibevoice_runtime_lora(
+    const assets::TensorSource & base,
+    const std::filesystem::path & adapter_path,
+    float scale_override) {
+    const auto paths = resolve_adapter_paths(adapter_path);
+    const auto adapter_dir = resolve_adapter_dir(adapter_path);
+    const auto unsupported_override = [&]() -> std::optional<std::filesystem::path> {
+        const std::filesystem::path candidates[] = {
+            adapter_dir / "diffusion_head" / "model.safetensors",
+            adapter_dir / "diffusion_head_full.bin",
+            adapter_dir / "diffusion_head" / "diffusion_head_full.bin",
+            adapter_dir / "acoustic_connector" / "pytorch_model.bin",
+            adapter_dir / "semantic_connector" / "pytorch_model.bin",
+        };
+        for (const auto & candidate : candidates) {
+            if (engine::io::is_existing_file(candidate)) {
+                return candidate;
+            }
+        }
+        return std::nullopt;
+    }();
+    if (unsupported_override.has_value()) {
+        throw std::runtime_error(
+            "VibeVoice runtime LoRA supports decoder PEFT tensors only; found full-weight override: " +
+            unsupported_override->string());
+    }
+
+    const float scale = resolve_adapter_scale(paths.config, scale_override);
+    const auto adapter = assets::open_tensor_source(paths.weights);
+    const auto tensor_names = collect_lora_tensor_names(*adapter);
+    if (tensor_names.empty()) {
+        throw std::runtime_error(
+            "VibeVoice runtime LoRA adapter contains no lora_A/lora_B tensors: " +
+            paths.weights.string());
+    }
+
+    VibeVoiceLoraAdapterData out;
+    out.scale = scale;
+    out.tensors.reserve(tensor_names.size());
+    for (const auto & [module_path, names] : tensor_names) {
+        const std::string base_name = resolve_base_weight_name(base, module_path);
+        auto delta = load_lora_delta(base, *adapter, module_path, names, base_name, scale);
+        if (out.rank == 0) {
+            out.rank = delta.r;
+        } else if (out.rank != delta.r) {
+            throw std::runtime_error("VibeVoice runtime LoRA requires one rank across all adapter tensors");
+        }
+        VibeVoiceLoraTensorDelta item;
+        item.base_weight_name = base_name;
+        item.rank = delta.r;
+        item.in_features = delta.in;
+        item.out_features = delta.out;
+        item.scale = delta.scale;
+        item.a = std::move(delta.a);
+        item.b = std::move(delta.b);
+        out.tensors.push_back(std::move(item));
+    }
+    std::sort(out.tensors.begin(), out.tensors.end(), [](const auto & lhs, const auto & rhs) {
+        return lhs.base_weight_name < rhs.base_weight_name;
+    });
+    return out;
+}
 
 std::shared_ptr<const assets::TensorSource> make_vibevoice_finetune_source(
     std::shared_ptr<const assets::TensorSource> base,

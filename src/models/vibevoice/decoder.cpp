@@ -3,6 +3,7 @@
 #include "engine/framework/core/backend_weight_store.h"
 #include "engine/framework/debug/profiler.h"
 #include "engine/framework/debug/trace.h"
+#include "engine/framework/io/json.h"
 #include "engine/framework/modules/activation_modules.h"
 #include "engine/framework/modules/norm_modules.h"
 #include "engine/framework/modules/lookup_modules.h"
@@ -12,6 +13,7 @@
 #include "engine/framework/modules/structural_modules.h"
 #include "engine/framework/modules/weight_binding.h"
 #include "engine/framework/runtime/kv_cache.h"
+#include "engine/models/vibevoice/lora.h"
 
 #include "engine/framework/core/constant_tensor_cache.h"
 
@@ -21,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <unordered_map>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -58,6 +61,29 @@ int64_t require_head_dim(const VibeVoiceDecoderConfig & config) {
         throw std::runtime_error("VibeVoice decoder hidden_size must equal attention heads times head_dim");
     }
     return config.head_dim;
+}
+
+core::TensorValue build_lora_linear(
+    core::ModuleBuildContext & ctx,
+    const core::TensorValue & input,
+    const modules::LinearWeights & base,
+    const VibeVoiceDecoderLoraLinearWeights * lora,
+    int64_t in_features,
+    int64_t out_features,
+    bool use_bias) {
+    auto result = modules::LinearModule(
+        binding::linear_config(in_features, out_features, use_bias)).build(ctx, input, base);
+    if (lora == nullptr) {
+        return result;
+    }
+    const int64_t rank = lora->a.shape.dims[0];
+    auto low_rank = modules::LinearModule(
+        binding::linear_config(in_features, rank, false)).build(
+            ctx, input, modules::LinearWeights{lora->a, std::nullopt});
+    auto delta = modules::LinearModule(
+        binding::linear_config(rank, out_features, false)).build(
+            ctx, low_rank, modules::LinearWeights{lora->b, std::nullopt});
+    return modules::AddModule{}.build(ctx, result, delta);
 }
 
 core::TensorValue reshape_heads(
@@ -317,6 +343,318 @@ void write_causal_prefill_mask(ggml_tensor * tensor, int64_t batch_size, int64_t
 
 }  // namespace
 
+class VibeVoiceRuntimeLoraStore {
+public:
+    VibeVoiceRuntimeLoraStore(
+        const VibeVoiceAssets & assets,
+        ggml_backend_t backend,
+        int threads,
+        const std::filesystem::path & manifest_path)
+        : backend_(backend) {
+        if (manifest_path.empty()) {
+            return;
+        }
+        const auto root = engine::io::json::parse_file(manifest_path);
+        max_rank_ = engine::io::json::optional_i64(root, "max_rank", 128);
+        if (max_rank_ <= 0) {
+            throw std::runtime_error("VibeVoice runtime LoRA manifest max_rank must be positive");
+        }
+        const auto & adapters = root.require("adapters").as_object();
+        if (adapters.empty()) {
+            throw std::runtime_error("VibeVoice runtime LoRA manifest requires at least one adapter");
+        }
+
+        active_ = make_zero_resident(assets.config.decoder, threads, "vibevoice.runtime_lora.active");
+        for (const auto & [id, path_value] : adapters) {
+            if (id.empty()) {
+                throw std::runtime_error("VibeVoice runtime LoRA adapter id must not be empty");
+            }
+            auto data = load_vibevoice_runtime_lora(
+                *assets.model_weights,
+                std::filesystem::path(path_value.as_string()));
+            if (data.rank > max_rank_) {
+                throw std::runtime_error(
+                    "VibeVoice runtime LoRA adapter '" + id + "' rank " +
+                    std::to_string(data.rank) + " exceeds manifest max_rank " +
+                    std::to_string(max_rank_));
+            }
+            auto [it, inserted] = adapters_.emplace(
+                id,
+                make_resident(
+                    assets.config.decoder,
+                    data,
+                    threads,
+                    "vibevoice.runtime_lora." + id));
+            if (!inserted) {
+                throw std::runtime_error("duplicate VibeVoice runtime LoRA adapter id: " + id);
+            }
+            (void) it;
+        }
+        engine::debug::timing_log_scalar("vibevoice.runtime_lora.adapters", adapters_.size());
+        engine::debug::timing_log_scalar("vibevoice.runtime_lora.max_rank", max_rank_);
+    }
+
+    bool enabled() const noexcept {
+        return active_ != nullptr;
+    }
+
+    const VibeVoiceDecoderLoraLayerWeights * layer(size_t index) const noexcept {
+        if (active_ == nullptr || index >= active_->layers.size()) {
+            return nullptr;
+        }
+        return &active_->layers[index];
+    }
+
+    double activate(const std::string & id) {
+        if (!enabled()) {
+            if (id.empty()) {
+                return 0.0;
+            }
+            throw std::runtime_error("VibeVoice runtime LoRA is not configured");
+        }
+        if (id == active_id_) {
+            return 0.0;
+        }
+        const auto started = std::chrono::steady_clock::now();
+        if (id.empty()) {
+            clear_active();
+        } else {
+            const auto it = adapters_.find(id);
+            if (it == adapters_.end()) {
+                throw std::runtime_error("unknown VibeVoice runtime LoRA adapter id: " + id);
+            }
+            copy_resident(it->second, *active_);
+        }
+        ggml_backend_synchronize(backend_);
+        active_id_ = id;
+        const double elapsed = engine::debug::elapsed_ms(started);
+        engine::debug::timing_log_scalar("vibevoice.runtime_lora.switch_ms", elapsed);
+        engine::debug::trace_log_scalar("vibevoice.runtime_lora.active_adapter", active_id_);
+        return elapsed;
+    }
+
+    const std::string & active_id() const noexcept {
+        return active_id_;
+    }
+
+private:
+    struct Resident {
+        std::unique_ptr<core::ConstantTensorCache> cache;
+        std::vector<VibeVoiceDecoderLoraLayerWeights> layers;
+    };
+
+    using DeltaMap = std::unordered_map<std::string, const VibeVoiceLoraTensorDelta *>;
+
+    static std::vector<ggml_fp16_t> padded_a(
+        const VibeVoiceLoraTensorDelta & delta,
+        int64_t max_rank) {
+        std::vector<ggml_fp16_t> out(
+            static_cast<size_t>(max_rank * delta.in_features),
+            ggml_fp32_to_fp16(0.0F));
+        for (int64_t rank = 0; rank < delta.rank; ++rank) {
+            for (int64_t input = 0; input < delta.in_features; ++input) {
+                out[static_cast<size_t>(rank * delta.in_features + input)] =
+                    ggml_fp32_to_fp16(delta.a[static_cast<size_t>(rank * delta.in_features + input)]);
+            }
+        }
+        return out;
+    }
+
+    static std::vector<ggml_fp16_t> padded_scaled_b(
+        const VibeVoiceLoraTensorDelta & delta,
+        int64_t max_rank) {
+        std::vector<ggml_fp16_t> out(
+            static_cast<size_t>(delta.out_features * max_rank),
+            ggml_fp32_to_fp16(0.0F));
+        for (int64_t output = 0; output < delta.out_features; ++output) {
+            for (int64_t rank = 0; rank < delta.rank; ++rank) {
+                const float value =
+                    delta.b[static_cast<size_t>(output * delta.rank + rank)] * delta.scale;
+                out[static_cast<size_t>(output * max_rank + rank)] = ggml_fp32_to_fp16(value);
+            }
+        }
+        return out;
+    }
+
+    VibeVoiceDecoderLoraLinearWeights make_zero_linear(
+        core::ConstantTensorCache & cache,
+        int64_t in_features,
+        int64_t out_features) const {
+        const std::vector<ggml_fp16_t> a(
+            static_cast<size_t>(max_rank_ * in_features),
+            ggml_fp32_to_fp16(0.0F));
+        const std::vector<ggml_fp16_t> b(
+            static_cast<size_t>(out_features * max_rank_),
+            ggml_fp32_to_fp16(0.0F));
+        return {
+            cache.make_tensor(
+                core::TensorShape::from_dims({max_rank_, in_features}),
+                GGML_TYPE_F16,
+                a.data(),
+                a.size() * sizeof(a.front())),
+            cache.make_tensor(
+                core::TensorShape::from_dims({out_features, max_rank_}),
+                GGML_TYPE_F16,
+                b.data(),
+                b.size() * sizeof(b.front())),
+        };
+    }
+
+    VibeVoiceDecoderLoraLinearWeights make_linear(
+        core::ConstantTensorCache & cache,
+        const DeltaMap & deltas,
+        const std::string & name,
+        int64_t in_features,
+        int64_t out_features) const {
+        const auto it = deltas.find(name);
+        if (it == deltas.end()) {
+            throw std::runtime_error("VibeVoice runtime LoRA is missing target tensor: " + name);
+        }
+        const auto & delta = *it->second;
+        if (delta.in_features != in_features || delta.out_features != out_features) {
+            throw std::runtime_error("VibeVoice runtime LoRA target shape mismatch: " + name);
+        }
+        const auto a = padded_a(delta, max_rank_);
+        const auto b = padded_scaled_b(delta, max_rank_);
+        return {
+            cache.make_tensor(
+                core::TensorShape::from_dims({max_rank_, in_features}),
+                GGML_TYPE_F16,
+                a.data(),
+                a.size() * sizeof(a.front())),
+            cache.make_tensor(
+                core::TensorShape::from_dims({out_features, max_rank_}),
+                GGML_TYPE_F16,
+                b.data(),
+                b.size() * sizeof(b.front())),
+        };
+    }
+
+    std::unique_ptr<Resident> make_zero_resident(
+        const VibeVoiceDecoderConfig & config,
+        int threads,
+        const std::string & name) const {
+        auto out = std::make_unique<Resident>();
+        out->cache = std::make_unique<core::ConstantTensorCache>(
+            backend_, threads, name, 64ull * 1024ull * 1024ull);
+        out->layers.reserve(static_cast<size_t>(config.num_hidden_layers));
+        for (int64_t layer = 0; layer < config.num_hidden_layers; ++layer) {
+            (void) layer;
+            VibeVoiceDecoderLoraLayerWeights weights;
+            weights.q_proj = make_zero_linear(*out->cache, config.hidden_size, config.hidden_size);
+            weights.k_proj = make_zero_linear(
+                *out->cache,
+                config.hidden_size,
+                config.num_key_value_heads * config.head_dim);
+            weights.v_proj = make_zero_linear(
+                *out->cache,
+                config.hidden_size,
+                config.num_key_value_heads * config.head_dim);
+            weights.o_proj = make_zero_linear(*out->cache, config.hidden_size, config.hidden_size);
+            weights.gate_proj = make_zero_linear(*out->cache, config.hidden_size, config.intermediate_size);
+            weights.up_proj = make_zero_linear(*out->cache, config.hidden_size, config.intermediate_size);
+            weights.down_proj = make_zero_linear(*out->cache, config.intermediate_size, config.hidden_size);
+            out->layers.push_back(std::move(weights));
+        }
+        out->cache->ensure_uploaded();
+        return out;
+    }
+
+    std::unique_ptr<Resident> make_resident(
+        const VibeVoiceDecoderConfig & config,
+        const VibeVoiceLoraAdapterData & data,
+        int threads,
+        const std::string & name) const {
+        DeltaMap deltas;
+        deltas.reserve(data.tensors.size());
+        for (const auto & delta : data.tensors) {
+            deltas.emplace(delta.base_weight_name, &delta);
+        }
+        auto out = std::make_unique<Resident>();
+        out->cache = std::make_unique<core::ConstantTensorCache>(
+            backend_, threads, name, 64ull * 1024ull * 1024ull);
+        out->layers.reserve(static_cast<size_t>(config.num_hidden_layers));
+        for (int64_t layer = 0; layer < config.num_hidden_layers; ++layer) {
+            const std::string prefix = "model.language_model.layers." + std::to_string(layer);
+            VibeVoiceDecoderLoraLayerWeights weights;
+            weights.q_proj = make_linear(
+                *out->cache, deltas, prefix + ".self_attn.q_proj.weight",
+                config.hidden_size, config.hidden_size);
+            weights.k_proj = make_linear(
+                *out->cache, deltas, prefix + ".self_attn.k_proj.weight",
+                config.hidden_size, config.num_key_value_heads * config.head_dim);
+            weights.v_proj = make_linear(
+                *out->cache, deltas, prefix + ".self_attn.v_proj.weight",
+                config.hidden_size, config.num_key_value_heads * config.head_dim);
+            weights.o_proj = make_linear(
+                *out->cache, deltas, prefix + ".self_attn.o_proj.weight",
+                config.hidden_size, config.hidden_size);
+            weights.gate_proj = make_linear(
+                *out->cache, deltas, prefix + ".mlp.gate_proj.weight",
+                config.hidden_size, config.intermediate_size);
+            weights.up_proj = make_linear(
+                *out->cache, deltas, prefix + ".mlp.up_proj.weight",
+                config.hidden_size, config.intermediate_size);
+            weights.down_proj = make_linear(
+                *out->cache, deltas, prefix + ".mlp.down_proj.weight",
+                config.intermediate_size, config.hidden_size);
+            out->layers.push_back(std::move(weights));
+        }
+        if (deltas.size() != static_cast<size_t>(config.num_hidden_layers * 7)) {
+            throw std::runtime_error(
+                "VibeVoice runtime LoRA expected exactly seven targets per decoder layer");
+        }
+        out->cache->ensure_uploaded();
+        return out;
+    }
+
+    static void copy_linear(
+        const VibeVoiceDecoderLoraLinearWeights & source,
+        const VibeVoiceDecoderLoraLinearWeights & destination) {
+        ggml_backend_tensor_copy(source.a.tensor, destination.a.tensor);
+        ggml_backend_tensor_copy(source.b.tensor, destination.b.tensor);
+    }
+
+    static void copy_resident(const std::unique_ptr<Resident> & source, Resident & destination) {
+        for (size_t layer = 0; layer < source->layers.size(); ++layer) {
+            const auto & src = source->layers[layer];
+            const auto & dst = destination.layers[layer];
+            copy_linear(src.q_proj, dst.q_proj);
+            copy_linear(src.k_proj, dst.k_proj);
+            copy_linear(src.v_proj, dst.v_proj);
+            copy_linear(src.o_proj, dst.o_proj);
+            copy_linear(src.gate_proj, dst.gate_proj);
+            copy_linear(src.up_proj, dst.up_proj);
+            copy_linear(src.down_proj, dst.down_proj);
+        }
+    }
+
+    void clear_active() {
+        for (const auto & layer : active_->layers) {
+            ggml_backend_tensor_memset(layer.q_proj.a.tensor, 0, 0, ggml_nbytes(layer.q_proj.a.tensor));
+            ggml_backend_tensor_memset(layer.q_proj.b.tensor, 0, 0, ggml_nbytes(layer.q_proj.b.tensor));
+            ggml_backend_tensor_memset(layer.k_proj.a.tensor, 0, 0, ggml_nbytes(layer.k_proj.a.tensor));
+            ggml_backend_tensor_memset(layer.k_proj.b.tensor, 0, 0, ggml_nbytes(layer.k_proj.b.tensor));
+            ggml_backend_tensor_memset(layer.v_proj.a.tensor, 0, 0, ggml_nbytes(layer.v_proj.a.tensor));
+            ggml_backend_tensor_memset(layer.v_proj.b.tensor, 0, 0, ggml_nbytes(layer.v_proj.b.tensor));
+            ggml_backend_tensor_memset(layer.o_proj.a.tensor, 0, 0, ggml_nbytes(layer.o_proj.a.tensor));
+            ggml_backend_tensor_memset(layer.o_proj.b.tensor, 0, 0, ggml_nbytes(layer.o_proj.b.tensor));
+            ggml_backend_tensor_memset(layer.gate_proj.a.tensor, 0, 0, ggml_nbytes(layer.gate_proj.a.tensor));
+            ggml_backend_tensor_memset(layer.gate_proj.b.tensor, 0, 0, ggml_nbytes(layer.gate_proj.b.tensor));
+            ggml_backend_tensor_memset(layer.up_proj.a.tensor, 0, 0, ggml_nbytes(layer.up_proj.a.tensor));
+            ggml_backend_tensor_memset(layer.up_proj.b.tensor, 0, 0, ggml_nbytes(layer.up_proj.b.tensor));
+            ggml_backend_tensor_memset(layer.down_proj.a.tensor, 0, 0, ggml_nbytes(layer.down_proj.a.tensor));
+            ggml_backend_tensor_memset(layer.down_proj.b.tensor, 0, 0, ggml_nbytes(layer.down_proj.b.tensor));
+        }
+    }
+
+    ggml_backend_t backend_ = nullptr;
+    int64_t max_rank_ = 0;
+    std::unique_ptr<Resident> active_;
+    std::unordered_map<std::string, std::unique_ptr<Resident>> adapters_;
+    std::string active_id_;
+};
+
 VibeVoiceDecoderWeights load_vibevoice_decoder_weights(
     const VibeVoiceAssets & assets,
     ggml_backend_t backend,
@@ -495,7 +833,8 @@ public:
 
         auto & constants = runtime_->constants();
         constants.begin_graph();
-        for (const auto & layer : runtime_->weights().layers) {
+        for (size_t layer_index = 0; layer_index < runtime_->weights().layers.size(); ++layer_index) {
+            const auto & layer = runtime_->weights().layers[layer_index];
             auto layer_out = build_vibevoice_decoder_layer(
                 ctx,
                 x,
@@ -503,6 +842,7 @@ public:
                 layer,
                 config,
                 constants,
+                runtime_->runtime_lora_layer(layer_index),
                 std::nullopt,
                 std::nullopt,
                 attention_mask);
@@ -636,6 +976,7 @@ private:
         LayerGraph(
             const VibeVoiceDecoderWeightsRuntime & runtime,
             const VibeVoiceDecoderLayerWeights & layer,
+            size_t layer_index,
             int64_t batch_size,
             int64_t prompt_steps,
             size_t graph_arena_bytes)
@@ -678,6 +1019,7 @@ private:
                 layer,
                 config,
                 constants_,
+                runtime_->runtime_lora_layer(layer_index),
                 std::nullopt,
                 std::nullopt,
                 attention_mask);
@@ -872,6 +1214,7 @@ private:
             LayerGraph graph(
                 *runtime_,
                 runtime_->weights().layers[layer],
+                layer,
                 batch_size_,
                 prompt_steps_,
                 512ull * 1024ull * 1024ull);
@@ -928,6 +1271,7 @@ VibeVoiceDecoderLayerOutputs build_vibevoice_decoder_layer_scratch_tail(
     const VibeVoiceDecoderLayerWeights & weights,
     const VibeVoiceDecoderConfig & config,
     core::ConstantTensorCache & constants,
+    const VibeVoiceDecoderLoraLayerWeights * lora,
     const core::TensorValue & cache_key,
     const core::TensorValue & cache_value,
     const core::TensorValue & attention_mask);
@@ -973,7 +1317,8 @@ public:
         cache_values.reserve(runtime_->weights().layers.size());
         auto & constants = runtime_->constants();
         constants.begin_graph();
-        for (const auto & layer : runtime_->weights().layers) {
+        for (size_t layer_index = 0; layer_index < runtime_->weights().layers.size(); ++layer_index) {
+            const auto & layer = runtime_->weights().layers[layer_index];
             cache_keys.push_back(core::make_tensor(
                 ctx,
                 GGML_TYPE_F32,
@@ -991,6 +1336,7 @@ public:
                       layer,
                       config,
                       constants,
+                      runtime_->runtime_lora_layer(layer_index),
                       cache_keys.back(),
                       cache_values.back(),
                       attention_mask_value)
@@ -1001,6 +1347,7 @@ public:
                       layer,
                       config,
                       constants,
+                      runtime_->runtime_lora_layer(layer_index),
                       cache_keys.back(),
                       cache_values.back(),
                       cache_slot_value,
@@ -1193,7 +1540,8 @@ public:
         graph_ = ggml_new_graph_custom(ctx_.get(), 65536, false);
         auto & constants = runtime_->constants();
         constants.begin_graph();
-        for (const auto & layer : runtime_->weights().layers) {
+        for (size_t layer_index = 0; layer_index < runtime_->weights().layers.size(); ++layer_index) {
+            const auto & layer = runtime_->weights().layers[layer_index];
             cache_keys_.push_back(core::make_tensor(
                 ctx,
                 GGML_TYPE_F32,
@@ -1209,6 +1557,7 @@ public:
                 layer,
                 config,
                 constants,
+                runtime_->runtime_lora_layer(layer_index),
                 cache_keys_.back(),
                 cache_values_.back(),
                 cache_slot_value,
@@ -1474,7 +1823,8 @@ VibeVoiceDecoderWeightsRuntime::VibeVoiceDecoderWeightsRuntime(
     int threads,
     size_t weight_context_bytes,
     size_t constant_context_bytes,
-    assets::TensorStorageType weight_storage_type)
+    assets::TensorStorageType weight_storage_type,
+    const std::filesystem::path & runtime_lora_manifest)
     : assets_(std::move(assets)),
       threads_(threads) {
     if (assets_ == nullptr) {
@@ -1504,12 +1854,21 @@ VibeVoiceDecoderWeightsRuntime::VibeVoiceDecoderWeightsRuntime(
         threads_,
         "vibevoice.decoder.constants",
         constant_context_bytes);
+    if (!runtime_lora_manifest.empty()) {
+        const auto lora_started = std::chrono::steady_clock::now();
+        runtime_lora_ = std::make_unique<VibeVoiceRuntimeLoraStore>(
+            *assets_, backend_, threads_, runtime_lora_manifest);
+        engine::debug::timing_log_scalar(
+            "vibevoice.runtime_lora.load_ms",
+            engine::debug::elapsed_ms(lora_started));
+    }
 }
 
 VibeVoiceDecoderWeightsRuntime::~VibeVoiceDecoderWeightsRuntime() {
     cached_batch_graphs_.clear();
     prefill_graph_.reset();
     embedding_graph_.reset();
+    runtime_lora_.reset();
     constants_.reset();
     weights_.reset();
     if (backend_ != nullptr) {
@@ -1535,6 +1894,31 @@ core::ConstantTensorCache & VibeVoiceDecoderWeightsRuntime::constants() const no
 
 int VibeVoiceDecoderWeightsRuntime::threads() const noexcept {
     return threads_;
+}
+
+bool VibeVoiceDecoderWeightsRuntime::has_runtime_lora() const noexcept {
+    return runtime_lora_ != nullptr && runtime_lora_->enabled();
+}
+
+const VibeVoiceDecoderLoraLayerWeights * VibeVoiceDecoderWeightsRuntime::runtime_lora_layer(
+    size_t layer) const noexcept {
+    return runtime_lora_ == nullptr ? nullptr : runtime_lora_->layer(layer);
+}
+
+double VibeVoiceDecoderWeightsRuntime::activate_runtime_lora(const std::string & adapter_id) {
+    if (runtime_lora_ == nullptr) {
+        if (adapter_id.empty()) {
+            return 0.0;
+        }
+        throw std::runtime_error("VibeVoice runtime LoRA is not configured");
+    }
+    cached_batch_graphs_.clear();
+    return runtime_lora_->activate(adapter_id);
+}
+
+const std::string & VibeVoiceDecoderWeightsRuntime::active_runtime_lora() const noexcept {
+    static const std::string empty;
+    return runtime_lora_ == nullptr ? empty : runtime_lora_->active_id();
 }
 
 VibeVoiceTokenEmbeddings VibeVoiceDecoderWeightsRuntime::embed_tokens(
@@ -1773,6 +2157,7 @@ VibeVoiceDecoderLayerOutputs build_vibevoice_decoder_layer(
     const VibeVoiceDecoderLayerWeights & weights,
     const VibeVoiceDecoderConfig & config,
     core::ConstantTensorCache & constants,
+    const VibeVoiceDecoderLoraLayerWeights * lora,
     const std::optional<core::TensorValue> & prefix_key,
     const std::optional<core::TensorValue> & prefix_value,
     const std::optional<core::TensorValue> & attention_mask) {
@@ -1793,18 +2178,18 @@ VibeVoiceDecoderLayerOutputs build_vibevoice_decoder_layer(
     const modules::AddModule add;
 
     auto attn_in = hidden_norm.build(ctx, input, binding::norm_data(constants, weights.input_norm));
-    auto q = q_proj.build(
-        ctx,
-        attn_in,
-        binding::linear_data(constants, weights.self_attention.q_weight, weights.self_attention.q_bias));
-    auto k = k_proj.build(
-        ctx,
-        attn_in,
-        binding::linear_data(constants, weights.self_attention.k_weight, weights.self_attention.k_bias));
-    auto v = v_proj.build(
-        ctx,
-        attn_in,
-        binding::linear_data(constants, weights.self_attention.v_weight, weights.self_attention.v_bias));
+    auto q = build_lora_linear(
+        ctx, attn_in,
+        binding::linear_data(constants, weights.self_attention.q_weight, weights.self_attention.q_bias),
+        lora ? &lora->q_proj : nullptr, config.hidden_size, config.num_attention_heads * dim, true);
+    auto k = build_lora_linear(
+        ctx, attn_in,
+        binding::linear_data(constants, weights.self_attention.k_weight, weights.self_attention.k_bias),
+        lora ? &lora->k_proj : nullptr, config.hidden_size, config.num_key_value_heads * dim, true);
+    auto v = build_lora_linear(
+        ctx, attn_in,
+        binding::linear_data(constants, weights.self_attention.v_weight, weights.self_attention.v_bias),
+        lora ? &lora->v_proj : nullptr, config.hidden_size, config.num_key_value_heads * dim, true);
     q = reshape_heads(ctx, q, config.num_attention_heads, dim);
     k = reshape_heads(ctx, k, config.num_key_value_heads, dim);
     v = reshape_heads(ctx, v, config.num_key_value_heads, dim);
@@ -1839,23 +2224,25 @@ VibeVoiceDecoderLayerOutputs build_vibevoice_decoder_layer(
         ctx,
         context,
         core::TensorShape::from_dims({input.shape.dims[0], input.shape.dims[1], config.num_attention_heads * dim}));
-    auto attn_out = o_proj.build(ctx, context, binding::linear_data(constants, weights.self_attention.out_weight));
+    auto attn_out = build_lora_linear(
+        ctx, context, binding::linear_data(constants, weights.self_attention.out_weight),
+        lora ? &lora->o_proj : nullptr, config.hidden_size, config.hidden_size, false);
     auto x = add.build(
         ctx,
         input,
         attn_out);
 
     auto ff_in = hidden_norm.build(ctx, x, binding::norm_data(constants, weights.post_norm));
-    auto gate = modules::LinearModule(
-                    binding::linear_config(config.hidden_size, config.intermediate_size, false))
-                    .build(ctx, ff_in, weights.mlp.gate_proj);
+    auto gate = build_lora_linear(
+        ctx, ff_in, weights.mlp.gate_proj,
+        lora ? &lora->gate_proj : nullptr, config.hidden_size, config.intermediate_size, false);
     gate = modules::SiluModule{}.build(ctx, gate);
-    auto up = modules::LinearModule(
-                  binding::linear_config(config.hidden_size, config.intermediate_size, false))
-                  .build(ctx, ff_in, weights.mlp.up_proj);
-    auto ff = modules::LinearModule(
-                  binding::linear_config(config.intermediate_size, config.hidden_size, false))
-                  .build(ctx, modules::MulModule{}.build(ctx, gate, up), weights.mlp.down_proj);
+    auto up = build_lora_linear(
+        ctx, ff_in, weights.mlp.up_proj,
+        lora ? &lora->up_proj : nullptr, config.hidden_size, config.intermediate_size, false);
+    auto ff = build_lora_linear(
+        ctx, modules::MulModule{}.build(ctx, gate, up), weights.mlp.down_proj,
+        lora ? &lora->down_proj : nullptr, config.intermediate_size, config.hidden_size, false);
     auto output = add.build(ctx, x, ff);
     return {output, k, v};
 }
@@ -1867,6 +2254,7 @@ VibeVoiceDecoderLayerOutputs build_vibevoice_decoder_layer_static_tail(
     const VibeVoiceDecoderLayerWeights & weights,
     const VibeVoiceDecoderConfig & config,
     core::ConstantTensorCache & constants,
+    const VibeVoiceDecoderLoraLayerWeights * lora,
     const core::TensorValue & cache_key,
     const core::TensorValue & cache_value,
     const core::TensorValue & cache_slot,
@@ -1885,18 +2273,18 @@ VibeVoiceDecoderLayerOutputs build_vibevoice_decoder_layer_static_tail(
     const modules::AddModule add;
 
     auto attn_in = hidden_norm.build(ctx, input, binding::norm_data(constants, weights.input_norm));
-    auto q = q_proj.build(
-        ctx,
-        attn_in,
-        binding::linear_data(constants, weights.self_attention.q_weight, weights.self_attention.q_bias));
-    auto k = k_proj.build(
-        ctx,
-        attn_in,
-        binding::linear_data(constants, weights.self_attention.k_weight, weights.self_attention.k_bias));
-    auto v = v_proj.build(
-        ctx,
-        attn_in,
-        binding::linear_data(constants, weights.self_attention.v_weight, weights.self_attention.v_bias));
+    auto q = build_lora_linear(
+        ctx, attn_in,
+        binding::linear_data(constants, weights.self_attention.q_weight, weights.self_attention.q_bias),
+        lora ? &lora->q_proj : nullptr, config.hidden_size, config.num_attention_heads * dim, true);
+    auto k = build_lora_linear(
+        ctx, attn_in,
+        binding::linear_data(constants, weights.self_attention.k_weight, weights.self_attention.k_bias),
+        lora ? &lora->k_proj : nullptr, config.hidden_size, config.num_key_value_heads * dim, true);
+    auto v = build_lora_linear(
+        ctx, attn_in,
+        binding::linear_data(constants, weights.self_attention.v_weight, weights.self_attention.v_bias),
+        lora ? &lora->v_proj : nullptr, config.hidden_size, config.num_key_value_heads * dim, true);
     q = reshape_heads(ctx, q, config.num_attention_heads, dim);
     k = reshape_heads(ctx, k, config.num_key_value_heads, dim);
     v = reshape_heads(ctx, v, config.num_key_value_heads, dim);
@@ -1939,23 +2327,25 @@ VibeVoiceDecoderLayerOutputs build_vibevoice_decoder_layer_static_tail(
         ctx,
         context,
         core::TensorShape::from_dims({input.shape.dims[0], 1, config.num_attention_heads * dim}));
-    auto attn_out = o_proj.build(ctx, context, binding::linear_data(constants, weights.self_attention.out_weight));
+    auto attn_out = build_lora_linear(
+        ctx, context, binding::linear_data(constants, weights.self_attention.out_weight),
+        lora ? &lora->o_proj : nullptr, config.hidden_size, config.hidden_size, false);
     auto x = add.build(
         ctx,
         input,
         attn_out);
 
     auto ff_in = hidden_norm.build(ctx, x, binding::norm_data(constants, weights.post_norm));
-    auto gate = modules::LinearModule(
-                    binding::linear_config(config.hidden_size, config.intermediate_size, false))
-                    .build(ctx, ff_in, weights.mlp.gate_proj);
+    auto gate = build_lora_linear(
+        ctx, ff_in, weights.mlp.gate_proj,
+        lora ? &lora->gate_proj : nullptr, config.hidden_size, config.intermediate_size, false);
     gate = modules::SiluModule{}.build(ctx, gate);
-    auto up = modules::LinearModule(
-                  binding::linear_config(config.hidden_size, config.intermediate_size, false))
-                  .build(ctx, ff_in, weights.mlp.up_proj);
-    auto ff = modules::LinearModule(
-                  binding::linear_config(config.intermediate_size, config.hidden_size, false))
-                  .build(ctx, modules::MulModule{}.build(ctx, gate, up), weights.mlp.down_proj);
+    auto up = build_lora_linear(
+        ctx, ff_in, weights.mlp.up_proj,
+        lora ? &lora->up_proj : nullptr, config.hidden_size, config.intermediate_size, false);
+    auto ff = build_lora_linear(
+        ctx, modules::MulModule{}.build(ctx, gate, up), weights.mlp.down_proj,
+        lora ? &lora->down_proj : nullptr, config.intermediate_size, config.hidden_size, false);
     auto output = add.build(ctx, x, ff);
     return {output, k, v};
 }
@@ -1968,6 +2358,7 @@ VibeVoiceDecoderLayerOutputs build_vibevoice_decoder_layer_scratch_tail(
     const VibeVoiceDecoderLayerWeights & weights,
     const VibeVoiceDecoderConfig & config,
     core::ConstantTensorCache & constants,
+    const VibeVoiceDecoderLoraLayerWeights * lora,
     const core::TensorValue & cache_key,
     const core::TensorValue & cache_value,
     const core::TensorValue & attention_mask) {
@@ -1988,18 +2379,18 @@ VibeVoiceDecoderLayerOutputs build_vibevoice_decoder_layer_scratch_tail(
     const modules::AddModule add;
 
     auto attn_in = hidden_norm.build(ctx, input, binding::norm_data(constants, weights.input_norm));
-    auto q = q_proj.build(
-        ctx,
-        attn_in,
-        binding::linear_data(constants, weights.self_attention.q_weight, weights.self_attention.q_bias));
-    auto k = k_proj.build(
-        ctx,
-        attn_in,
-        binding::linear_data(constants, weights.self_attention.k_weight, weights.self_attention.k_bias));
-    auto v = v_proj.build(
-        ctx,
-        attn_in,
-        binding::linear_data(constants, weights.self_attention.v_weight, weights.self_attention.v_bias));
+    auto q = build_lora_linear(
+        ctx, attn_in,
+        binding::linear_data(constants, weights.self_attention.q_weight, weights.self_attention.q_bias),
+        lora ? &lora->q_proj : nullptr, config.hidden_size, config.num_attention_heads * dim, true);
+    auto k = build_lora_linear(
+        ctx, attn_in,
+        binding::linear_data(constants, weights.self_attention.k_weight, weights.self_attention.k_bias),
+        lora ? &lora->k_proj : nullptr, config.hidden_size, config.num_key_value_heads * dim, true);
+    auto v = build_lora_linear(
+        ctx, attn_in,
+        binding::linear_data(constants, weights.self_attention.v_weight, weights.self_attention.v_bias),
+        lora ? &lora->v_proj : nullptr, config.hidden_size, config.num_key_value_heads * dim, true);
     q = reshape_heads(ctx, q, config.num_attention_heads, dim);
     k = reshape_heads(ctx, k, config.num_key_value_heads, dim);
     v = reshape_heads(ctx, v, config.num_key_value_heads, dim);
@@ -2040,20 +2431,22 @@ VibeVoiceDecoderLayerOutputs build_vibevoice_decoder_layer_scratch_tail(
         ctx,
         context,
         core::TensorShape::from_dims({input.shape.dims[0], 1, config.num_attention_heads * dim}));
-    auto attn_out = o_proj.build(ctx, context, binding::linear_data(constants, weights.self_attention.out_weight));
+    auto attn_out = build_lora_linear(
+        ctx, context, binding::linear_data(constants, weights.self_attention.out_weight),
+        lora ? &lora->o_proj : nullptr, config.hidden_size, config.hidden_size, false);
     auto x = add.build(ctx, input, attn_out);
 
     auto ff_in = hidden_norm.build(ctx, x, binding::norm_data(constants, weights.post_norm));
-    auto gate = modules::LinearModule(
-                    binding::linear_config(config.hidden_size, config.intermediate_size, false))
-                    .build(ctx, ff_in, weights.mlp.gate_proj);
+    auto gate = build_lora_linear(
+        ctx, ff_in, weights.mlp.gate_proj,
+        lora ? &lora->gate_proj : nullptr, config.hidden_size, config.intermediate_size, false);
     gate = modules::SiluModule{}.build(ctx, gate);
-    auto up = modules::LinearModule(
-                  binding::linear_config(config.hidden_size, config.intermediate_size, false))
-                  .build(ctx, ff_in, weights.mlp.up_proj);
-    auto ff = modules::LinearModule(
-                  binding::linear_config(config.intermediate_size, config.hidden_size, false))
-                  .build(ctx, modules::MulModule{}.build(ctx, gate, up), weights.mlp.down_proj);
+    auto up = build_lora_linear(
+        ctx, ff_in, weights.mlp.up_proj,
+        lora ? &lora->up_proj : nullptr, config.hidden_size, config.intermediate_size, false);
+    auto ff = build_lora_linear(
+        ctx, modules::MulModule{}.build(ctx, gate, up), weights.mlp.down_proj,
+        lora ? &lora->down_proj : nullptr, config.intermediate_size, config.hidden_size, false);
     auto output = add.build(ctx, x, ff);
     return {output, k, v};
 }

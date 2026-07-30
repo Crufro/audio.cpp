@@ -225,6 +225,10 @@ engine::runtime::TaskRequest make_task_request(
     set_optional_i64_option(request, object, "top_k", "top_k");
     set_optional_f32_option(request, object, "top_p", "top_p");
     set_optional_i64_option(request, object, "seed", "seed");
+    const auto adapter_id = optional_string(object, "adapter_id");
+    if (!adapter_id.empty()) {
+        request.options["vibevoice.adapter_id"] = adapter_id;
+    }
     request.options["prompt_noise_file"] = prompt_noise_file.empty()
         ? optional_string(object, "prompt_noise_file")
         : prompt_noise_file;
@@ -392,6 +396,8 @@ int main(int argc, char ** argv) {
         const std::string noise_file = arg_value(argc, argv, "--noise-file", "");
         const std::string log_file = arg_value(argc, argv, "--log-file", "");
         const std::string lora_path = arg_value(argc, argv, "--lora", "");
+        const std::string runtime_lora_manifest =
+            arg_value(argc, argv, "--runtime-lora-manifest", "");
         const std::string weight_type = arg_value(argc, argv, "--weight-type", "");
         const bool batch = has_arg(argc, argv, "--batch");
         const std::filesystem::path output_dir = arg_value(argc, argv, "--output-dir", "");
@@ -494,6 +500,9 @@ int main(int argc, char ** argv) {
             options.backend.threads = threads;
             if (!weight_type.empty()) {
                 options.options["vibevoice.weight_type"] = weight_type;
+            }
+            if (!runtime_lora_manifest.empty()) {
+                options.options["vibevoice.runtime_lora_manifest"] = runtime_lora_manifest;
             }
             engine::models::vibevoice::VibeVoiceSession session(
                 {engine::runtime::VoiceTaskKind::Tts, engine::runtime::RunMode::Offline},

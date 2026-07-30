@@ -7,8 +7,33 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace engine::models::vibevoice {
+
+struct VibeVoiceLoraTensorDelta {
+    std::string base_weight_name;
+    int64_t rank = 0;
+    int64_t in_features = 0;
+    int64_t out_features = 0;
+    float scale = 1.0F;
+    std::vector<float> a;
+    std::vector<float> b;
+};
+
+struct VibeVoiceLoraAdapterData {
+    int64_t rank = 0;
+    float scale = 1.0F;
+    std::vector<VibeVoiceLoraTensorDelta> tensors;
+};
+
+// Loads and validates decoder LoRA tensors without merging them into the base.
+// Optional full-weight diffusion/connector overrides are deliberately rejected:
+// runtime adapter switching currently supports decoder PEFT LoRA only.
+VibeVoiceLoraAdapterData load_vibevoice_runtime_lora(
+    const assets::TensorSource & base,
+    const std::filesystem::path & adapter_path,
+    float scale_override = -1.0F);
 
 // Overlays a fine-tune adapter directory onto a base weight source: the language-model LoRA is
 // delta-merged into the decoder linears, and the diffusion head and acoustic/semantic connectors
