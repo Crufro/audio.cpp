@@ -604,6 +604,10 @@ Runtime LoRA manifests use
 `"residency":"host_lru"` mode keeps the full adapter roster in host memory and
 uses `"gpu_cache_slots":4` recent GPU copies plus the stable active slot;
 `"residency":"gpu"` remains the default.
+In `host_lru` mode, `"min_free_vram_mb":3072` sets the minimum device-memory
+reserve. The effective reserve is the larger of that value and 12.5% of device
+capacity. GPU cache slots are a maximum: the runtime admits and destroys LRU
+slots dynamically so graph allocations preserve the reserve.
 The runtime path supports decoder PEFT A/B tensors only, converts them to fp16, pads
 smaller ranks to `max_rank`, and folds each adapter's configured scale into B. All
 listed adapters plus one active slot remain on the selected backend. Full diffusion

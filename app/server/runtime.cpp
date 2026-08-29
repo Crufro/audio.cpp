@@ -559,11 +559,30 @@ HttpResponse ServerState::handle(const HttpRequest & request) {
         response.headers["Access-Control-Allow-Methods"] = "GET, POST";
     }
     else if (request.method == "GET" && request.path == "/health") {
+        const auto memory = engine::core::query_backend_memory(
+            engine::core::BackendConfig{config_.backend, config_.device, config_.threads});
+        bool degraded = false;
+        bool recovering = false;
+        bool unhealthy = false;
+        uint64_t targeted_recoveries = 0;
+        uint64_t model_reloads = 0;
+        for (const auto & model : models_) {
+            degraded = degraded || model->memory_state == "degraded";
+            recovering = recovering || model->memory_state == "recovering";
+            unhealthy = unhealthy || model->memory_state == "unhealthy";
+            targeted_recoveries += model->targeted_recoveries;
+            model_reloads += model->model_reloads;
+        }
         response = json_response(
-            "{\"status\":\"ok\",\"backend\":\"" +
+            "{\"status\":\"" + std::string(unhealthy ? "error" : "ok") + "\",\"backend\":\"" +
             std::string(backend_name(config_.backend)) +
             "\",\"models\":" +
             std::to_string(models_.size()) +
+            ",\"memory_state\":\"" + (unhealthy ? "unhealthy" : recovering ? "recovering" : degraded ? "degraded" : "normal") +
+            "\",\"memory_total_bytes\":" + std::to_string(memory.total_bytes) +
+            ",\"memory_free_bytes\":" + std::to_string(memory.free_bytes) +
+            ",\"targeted_recoveries\":" + std::to_string(targeted_recoveries) +
+            ",\"model_reloads\":" + std::to_string(model_reloads) +
             "}");
     }
     else if (request.method == "GET" && request.path == "/v1/models") {
@@ -672,6 +691,9 @@ void ServerState::ensure_model_loaded_locked(LoadedModel & model) {
     session_options.backend.device = config_.device;
     session_options.backend.threads = config_.threads;
     session_options.options = model.config.session_options;
+    if (model.memory_state == "degraded" && model.config.family == "vibevoice") {
+        session_options.options["vibevoice.disable_optional_gpu_cache"] = "true";
+    }
 
     auto loaded_model = registry.load(load_request);
     auto session = loaded_model->create_task_session(model.task, session_options);
@@ -687,6 +709,13 @@ void ServerState::ensure_model_loaded_locked(LoadedModel & model) {
     model.session = std::move(session);
     model.offline = offline;
     model.streaming = streaming;
+}
+
+void ServerState::unload_model_locked(LoadedModel & model) {
+    model.offline = nullptr;
+    model.streaming = nullptr;
+    model.session.reset();
+    model.model.reset();
 }
 
 ServerState::LoadedModel & ServerState::require_model(const Value & body) {
@@ -787,6 +816,7 @@ struct ServerState::TimedTaskResult {
     engine::runtime::TaskResult result;
     double wall_ms = 0.0;
     std::optional<double> ttft_ms;
+    std::string recovery = "none";
 };
 
 int ServerState::model_busy_timeout_ceiling(const LoadedModel & model) const {
@@ -811,9 +841,64 @@ ServerState::TimedTaskResult ServerState::run_model(
         throw std::runtime_error("configured model does not provide offline execution: " + model.config.id);
     }
     const auto started = Clock::now();
-    model.session->prepare(engine::runtime::build_preparation_request(request));
-    auto result = model.offline->run(request);
-    return TimedTaskResult{std::move(result), elapsed_ms(started), std::nullopt};
+    const auto deadline = started + std::chrono::seconds(120);
+    auto run_once = [&]() {
+        model.session->prepare(engine::runtime::build_preparation_request(request));
+        return model.offline->run(request);
+    };
+    try {
+        auto result = run_once();
+        return TimedTaskResult{std::move(result), elapsed_ms(started), std::nullopt, "none"};
+    } catch (const engine::core::BackendAllocationError & first) {
+        model.memory_state = "recovering";
+        model.last_recovery_error = first.what();
+        ++model.targeted_recoveries;
+        std::cerr << "[memory_recovery] model=" << model.config.id
+                  << " stage=targeted requested_bytes=" << first.requested_bytes()
+                  << " free_bytes=" << first.memory().free_bytes << "\n";
+        if (auto * recoverable = dynamic_cast<engine::runtime::IMemoryPressureRecoverable *>(model.session.get())) {
+            recoverable->release_optional_device_memory();
+        }
+        try {
+            auto result = run_once();
+            model.memory_state = "normal";
+            return TimedTaskResult{std::move(result), elapsed_ms(started), std::nullopt, "targeted"};
+        } catch (const engine::core::BackendAllocationError & second) {
+            model.last_recovery_error = second.what();
+            if (Clock::now() >= deadline) {
+                model.memory_state = "degraded";
+                throw;
+            }
+            unload_model_locked(model);
+            model.memory_state = "degraded";
+            ++model.model_reloads;
+            std::cerr << "[memory_recovery] model=" << model.config.id
+                      << " stage=reload requested_bytes=" << second.requested_bytes()
+                      << " free_bytes=" << second.memory().free_bytes << "\n";
+            try {
+                ensure_model_loaded_locked(model);
+            } catch (const std::exception & reload_error) {
+                model.memory_state = "unhealthy";
+                model.last_recovery_error = reload_error.what();
+                throw;
+            }
+            if (Clock::now() >= deadline) {
+                throw engine::core::BackendAllocationError(
+                    "VibeVoice recovery exceeded its 120 second deadline",
+                    second.requested_bytes(), second.memory());
+            }
+            try {
+                auto result = run_once();
+                std::cerr << "[memory_recovery] model=" << model.config.id
+                          << " stage=reload_complete state=degraded\n";
+                return TimedTaskResult{std::move(result), elapsed_ms(started), std::nullopt, "reload"};
+            } catch (const std::exception & final_error) {
+                model.memory_state = "unhealthy";
+                model.last_recovery_error = final_error.what();
+                throw;
+            }
+        }
+    }
 }
 
 ServerState::TimedTaskResult ServerState::run_streaming_model(
@@ -872,6 +957,7 @@ HttpResponse ServerState::handle_speech(const std::string & body_text) {
     response.content_type = "audio/wav";
     response.body = std::string(reinterpret_cast<const char *>(wav.data()), wav.size());
     response.headers = timing_headers(timed_result.wall_ms, audio);
+    response.headers["X-AudioCPP-Recovery"] = timed_result.recovery;
     return response;
 }
 
@@ -1202,6 +1288,10 @@ std::string ServerState::models_json() const {
             << ",\"family\":" << json_quote(model.config.family)
             << ",\"task\":" << json_quote(engine::runtime::to_string(model.task.task))
             << ",\"mode\":" << json_quote(engine::runtime::to_string(model.task.mode))
+            << ",\"memory_state\":" << json_quote(model.memory_state)
+            << ",\"targeted_recoveries\":" << model.targeted_recoveries
+            << ",\"model_reloads\":" << model.model_reloads
+            << ",\"last_recovery_error\":" << json_quote(model.last_recovery_error)
             << "}";
     }
     out << "]}";

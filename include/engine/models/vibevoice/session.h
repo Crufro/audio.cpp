@@ -17,7 +17,8 @@ namespace engine::models::vibevoice {
 
 class VibeVoiceSession final
     : public runtime::RuntimeSessionBase
-    , public runtime::IOfflineVoiceTaskSession {
+    , public runtime::IOfflineVoiceTaskSession
+    , public runtime::IMemoryPressureRecoverable {
 public:
     VibeVoiceSession(
         runtime::TaskSpec task,
@@ -29,6 +30,7 @@ public:
     runtime::RunMode run_mode() const override;
     void prepare(const runtime::SessionPreparationRequest & request) override;
     runtime::TaskResult run(const runtime::TaskRequest & request) override;
+    void release_optional_device_memory() override;
 
 private:
     struct ReferenceVoiceStateCacheEntry {

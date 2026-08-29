@@ -280,6 +280,14 @@ public:
     virtual void prepare_capacity(int64_t capacity) = 0;
 };
 
+// Optional interface for sessions that can discard non-essential device state
+// after a backend allocation failure and safely retry the same request.
+class IMemoryPressureRecoverable {
+public:
+    virtual ~IMemoryPressureRecoverable() = default;
+    virtual void release_optional_device_memory() = 0;
+};
+
 using GraphCapacityCanonicalFn = std::function<int64_t(int64_t)>;
 using GraphCapacityPreparedFn = std::function<std::vector<int64_t>()>;
 using GraphCapacityPrepareFn = std::function<void(int64_t)>;

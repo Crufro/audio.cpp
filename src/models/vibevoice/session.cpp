@@ -79,7 +79,8 @@ const runtime::SessionOptions & require_supported_backend_options(const runtime:
             validate_weight_storage(engine::assets::parse_tensor_storage_type(value), key.c_str());
         } else if (key == "vibevoice.lora" ||
                    key == "vibevoice.lora_scale" ||
-                   key == "vibevoice.runtime_lora_manifest") {
+                   key == "vibevoice.runtime_lora_manifest" ||
+                   key == "vibevoice.disable_optional_gpu_cache") {
             // Validated where the adapter is loaded.
         } else if (key.rfind("vibevoice.", 0) == 0) {
             throw std::runtime_error("unknown VibeVoice session option: " + key);
@@ -262,7 +263,9 @@ VibeVoiceSession::VibeVoiceSession(
               : (options.options.find("vibevoice.weight_type") != options.options.end()
                       ? engine::assets::parse_tensor_storage_type(options.options.at("vibevoice.weight_type"))
                       : engine::assets::TensorStorageType::Native),
-          runtime_lora_manifest(options)),
+          runtime_lora_manifest(options),
+          runtime::find_option(options.options, {"vibevoice.disable_optional_gpu_cache"})
+                  .value_or("false") == "true"),
       diffusion_head_(
           assets_,
           options.backend.type,
@@ -309,10 +312,17 @@ runtime::TaskResult VibeVoiceSession::run(const runtime::TaskRequest & request) 
         diffusion_head_,
         positive_decoder_cache_,
         negative_decoder_cache_);
+    decoder_.ensure_device_headroom(0);
     runtime::TaskResult out;
     out.audio_output = std::move(result.audio);
     engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(wall_start));
     return out;
+}
+
+void VibeVoiceSession::release_optional_device_memory() {
+    positive_decoder_cache_ = VibeVoiceDecoderCachedState{};
+    negative_decoder_cache_ = VibeVoiceDecoderCachedState{};
+    decoder_.release_optional_device_memory();
 }
 
 VibeVoiceRequest VibeVoiceSession::make_request(const runtime::TaskRequest & request) const {

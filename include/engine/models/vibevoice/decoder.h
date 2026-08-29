@@ -131,7 +131,8 @@ public:
         size_t weight_context_bytes = 256ull * 1024ull * 1024ull,
         size_t constant_context_bytes = 128ull * 1024ull * 1024ull,
         assets::TensorStorageType weight_storage_type = assets::TensorStorageType::Native,
-        const std::filesystem::path & runtime_lora_manifest = {});
+        const std::filesystem::path & runtime_lora_manifest = {},
+        bool disable_optional_gpu_cache = false);
 
     ~VibeVoiceDecoderWeightsRuntime();
 
@@ -141,12 +142,15 @@ public:
     const VibeVoiceAssets & assets() const noexcept;
     const VibeVoiceDecoderWeights & weights() const noexcept;
     ggml_backend_t backend() const noexcept;
+    int device() const noexcept;
     core::ConstantTensorCache & constants() const noexcept;
     int threads() const noexcept;
     bool has_runtime_lora() const noexcept;
     const VibeVoiceDecoderLoraLayerWeights * runtime_lora_layer(size_t layer) const noexcept;
     double activate_runtime_lora(const std::string & adapter_id);
     const std::string & active_runtime_lora() const noexcept;
+    void ensure_device_headroom(int64_t requested_bytes) const;
+    void release_optional_device_memory() const;
 
     VibeVoiceTokenEmbeddings embed_tokens(const std::vector<int32_t> & input_ids) const;
     VibeVoiceDecoderPrefillOutput prefill_embeddings(const std::vector<float> & embeddings, int64_t steps) const;
@@ -176,6 +180,7 @@ private:
     mutable std::unique_ptr<VibeVoiceDecoderPrefillGraph> prefill_graph_;
     mutable std::vector<std::unique_ptr<VibeVoiceDecoderCachedBatchStepGraph>> cached_batch_graphs_;
     ggml_backend_t backend_ = nullptr;
+    int device_ = 0;
     int threads_ = 1;
 };
 

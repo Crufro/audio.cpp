@@ -7,6 +7,7 @@
 #include "ggml-cpu.h"
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,22 @@ struct BackendMemorySnapshot {
     int64_t total_bytes = 0;
     int64_t used_bytes = 0;
     int64_t free_bytes = 0;
+};
+
+class BackendAllocationError : public std::runtime_error {
+public:
+    BackendAllocationError(
+        const std::string & message,
+        int64_t requested_bytes,
+        BackendMemorySnapshot memory)
+        : std::runtime_error(message), requested_bytes_(requested_bytes), memory_(memory) {}
+
+    int64_t requested_bytes() const noexcept { return requested_bytes_; }
+    const BackendMemorySnapshot & memory() const noexcept { return memory_; }
+
+private:
+    int64_t requested_bytes_ = 0;
+    BackendMemorySnapshot memory_;
 };
 
 ggml_backend_t init_backend(const BackendConfig & config);

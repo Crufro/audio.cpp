@@ -34,6 +34,35 @@
 namespace engine::models::vibevoice {
 namespace {
 
+int64_t estimate_context_allocation_bytes(ggml_context * ctx, ggml_backend_t backend) {
+    const auto buft = ggml_backend_get_default_buffer_type(backend);
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    int64_t total = 0;
+    for (ggml_tensor * tensor = ggml_get_first_tensor(ctx);
+         tensor != nullptr;
+         tensor = ggml_get_next_tensor(ctx, tensor)) {
+        total += static_cast<int64_t>(GGML_PAD(
+            ggml_backend_buft_get_alloc_size(buft, tensor), alignment));
+    }
+    return total;
+}
+
+ggml_backend_buffer_t allocate_context_or_throw(
+    ggml_context * ctx,
+    const VibeVoiceDecoderWeightsRuntime & runtime,
+    const char * message) {
+    const int64_t requested_bytes = estimate_context_allocation_bytes(ctx, runtime.backend());
+    runtime.ensure_device_headroom(requested_bytes);
+    auto buffer = ggml_backend_alloc_ctx_tensors(ctx, runtime.backend());
+    if (buffer == nullptr) {
+        throw core::BackendAllocationError(
+            message,
+            requested_bytes,
+            core::query_backend_memory(runtime.backend(), runtime.device()));
+    }
+    return buffer;
+}
+
 namespace binding = modules::binding;
 
 constexpr int64_t kGroupedCachedAttentionMinSteps = 4096;
@@ -350,9 +379,12 @@ public:
     VibeVoiceRuntimeLoraStore(
         const VibeVoiceAssets & assets,
         ggml_backend_t backend,
+        int device,
         int threads,
-        const std::filesystem::path & manifest_path)
+        const std::filesystem::path & manifest_path,
+        bool disable_optional_gpu_cache)
         : backend_(backend),
+          device_(device),
           assets_config_(assets.config.decoder),
           threads_(threads) {
         if (manifest_path.empty()) {
@@ -377,9 +409,18 @@ public:
         host_lru_ = residency == "host_lru";
         gpu_cache_slots_ = engine::io::json::optional_i64(
             root, "gpu_cache_slots", host_lru_ ? 4 : 0);
+        min_free_vram_bytes_ = static_cast<int64_t>(engine::io::json::optional_i64(
+            root, "min_free_vram_mb", 3072)) * 1024ll * 1024ll;
         if (gpu_cache_slots_ < 0) {
             throw std::runtime_error(
                 "VibeVoice runtime LoRA manifest gpu_cache_slots must be non-negative");
+        }
+        if (min_free_vram_bytes_ < 0) {
+            throw std::runtime_error(
+                "VibeVoice runtime LoRA manifest min_free_vram_mb must be non-negative");
+        }
+        if (disable_optional_gpu_cache) {
+            gpu_cache_slots_ = 0;
         }
         if (host_lru_) {
             cpu_backend_ = core::init_backend(
@@ -477,6 +518,20 @@ public:
 
     const std::string & active_id() const noexcept {
         return active_id_;
+    }
+
+    void release_optional_device_memory() {
+        if (gpu_cache_.empty()) {
+            return;
+        }
+        const auto count = gpu_cache_.size();
+        gpu_cache_.clear();
+        ggml_backend_synchronize(backend_);
+        engine::debug::timing_log_scalar("vibevoice.runtime_lora.cache_evictions", count);
+    }
+
+    void ensure_device_headroom(int64_t requested_bytes) {
+        trim_to_reserve(std::max<int64_t>(0, requested_bytes));
     }
 
 private:
@@ -697,8 +752,13 @@ private:
         if (gpu_cache_slots_ == 0) {
             return host;
         }
+        trim_to_reserve(estimated_slot_bytes());
         CacheSlot * selected = nullptr;
         if (gpu_cache_.size() < static_cast<size_t>(gpu_cache_slots_)) {
+            const auto memory = core::query_backend_memory(backend_, device_);
+            if (memory.available && memory.free_bytes < effective_reserve(memory) + estimated_slot_bytes()) {
+                return host;
+            }
             CacheSlot slot;
             slot.resident = make_zero_resident(
                 assets_config_,
@@ -722,6 +782,48 @@ private:
         return selected->resident;
     }
 
+    int64_t estimated_slot_bytes() const {
+        const int64_t kv = assets_config_.num_key_value_heads * assets_config_.head_dim;
+        const int64_t per_layer =
+            2 * (assets_config_.hidden_size + assets_config_.hidden_size) +
+            2 * (assets_config_.hidden_size + kv) +
+            3 * (assets_config_.hidden_size + assets_config_.intermediate_size);
+        return per_layer * assets_config_.num_hidden_layers * max_rank_ *
+            static_cast<int64_t>(sizeof(ggml_fp16_t));
+    }
+
+    int64_t effective_reserve(const core::BackendMemorySnapshot & memory) const {
+        return std::max(min_free_vram_bytes_, memory.total_bytes / 8);
+    }
+
+    void trim_to_reserve(int64_t additional_bytes = 0) {
+        auto memory = core::query_backend_memory(backend_, device_);
+        if (memory.available) {
+            engine::debug::timing_log_scalar(
+                "vibevoice.runtime_lora.vram_free_before", memory.free_bytes);
+            engine::debug::timing_log_scalar(
+                "vibevoice.runtime_lora.vram_reserve", effective_reserve(memory));
+            engine::debug::timing_log_scalar(
+                "vibevoice.runtime_lora.vram_requested", additional_bytes);
+        }
+        while (memory.available && !gpu_cache_.empty() &&
+               memory.free_bytes < effective_reserve(memory) + additional_bytes) {
+            const auto selected = std::min_element(
+                gpu_cache_.begin(), gpu_cache_.end(),
+                [](const CacheSlot & lhs, const CacheSlot & rhs) {
+                    return lhs.last_used < rhs.last_used;
+                });
+            gpu_cache_.erase(selected);
+            ggml_backend_synchronize(backend_);
+            engine::debug::timing_log_scalar("vibevoice.runtime_lora.cache_evictions", 1);
+            memory = core::query_backend_memory(backend_, device_);
+        }
+        if (memory.available) {
+            engine::debug::timing_log_scalar(
+                "vibevoice.runtime_lora.vram_free_after", memory.free_bytes);
+        }
+    }
+
     void clear_active() {
         for (const auto & layer : active_->layers) {
             ggml_backend_tensor_memset(layer.q_proj.a.tensor, 0, 0, ggml_nbytes(layer.q_proj.a.tensor));
@@ -742,12 +844,14 @@ private:
     }
 
     ggml_backend_t backend_ = nullptr;
+    int device_ = 0;
     ggml_backend_t cpu_backend_ = nullptr;
     VibeVoiceDecoderConfig assets_config_;
     int threads_ = 1;
     int64_t max_rank_ = 0;
     bool host_lru_ = false;
     int64_t gpu_cache_slots_ = 0;
+    int64_t min_free_vram_bytes_ = 3072ll * 1024ll * 1024ll;
     uint64_t cache_clock_ = 0;
     uint64_t cache_hits_ = 0;
     uint64_t cache_misses_ = 0;
@@ -841,10 +945,8 @@ public:
         ggml_set_output(output_);
         graph_ = ggml_new_graph_custom(ctx_.get(), 4096, false);
         ggml_build_forward_expand(graph_, output_);
-        buffer_ = ggml_backend_alloc_ctx_tensors(ctx_.get(), runtime_->backend());
-        if (buffer_ == nullptr) {
-            throw std::runtime_error("failed to allocate VibeVoice decoder embedding graph");
-        }
+        buffer_ = allocate_context_or_throw(
+            ctx_.get(), *runtime_, "failed to allocate VibeVoice decoder embedding graph");
     }
 
     ~VibeVoiceDecoderEmbeddingGraph() {
@@ -965,10 +1067,8 @@ public:
         ggml_build_forward_expand(graph_, logits_output_);
         constants.finish_graph();
         constants.ensure_uploaded();
-        buffer_ = ggml_backend_alloc_ctx_tensors(ctx_.get(), runtime_->backend());
-        if (buffer_ == nullptr) {
-            throw std::runtime_error("failed to allocate VibeVoice decoder prefill graph");
-        }
+        buffer_ = allocate_context_or_throw(
+            ctx_.get(), *runtime_, "failed to allocate VibeVoice decoder prefill graph");
 
         const auto positions = build_position_values(prompt_steps_);
         ggml_backend_tensor_set(positions_, positions.data(), 0, positions.size() * sizeof(int32_t));
@@ -1133,10 +1233,8 @@ private:
             ggml_build_forward_expand(graph_, output_);
             constants_.finish_graph();
             constants_.ensure_uploaded();
-            buffer_ = ggml_backend_alloc_ctx_tensors(ctx_.get(), runtime_->backend());
-            if (buffer_ == nullptr) {
-                throw std::runtime_error("failed to allocate VibeVoice decoder layer prefill graph");
-            }
+            buffer_ = allocate_context_or_throw(
+                ctx_.get(), *runtime_, "failed to allocate VibeVoice decoder layer prefill graph");
 
             const auto position_values = build_position_values(prompt_steps_);
             ggml_backend_tensor_set(positions_, position_values.data(), 0, position_values.size() * sizeof(int32_t));
@@ -1230,10 +1328,8 @@ private:
             ggml_build_forward_expand(graph_, logits_output_);
             constants_.finish_graph();
             constants_.ensure_uploaded();
-            buffer_ = ggml_backend_alloc_ctx_tensors(ctx_.get(), runtime_->backend());
-            if (buffer_ == nullptr) {
-                throw std::runtime_error("failed to allocate VibeVoice decoder final prefill graph");
-            }
+            buffer_ = allocate_context_or_throw(
+                ctx_.get(), *runtime_, "failed to allocate VibeVoice decoder final prefill graph");
         }
 
         ~FinalGraph() {
@@ -1479,10 +1575,8 @@ public:
         ggml_build_forward_expand(graph_, logits_output_);
         constants.finish_graph();
         constants.ensure_uploaded();
-        buffer_ = ggml_backend_alloc_ctx_tensors(ctx_.get(), runtime_->backend());
-        if (buffer_ == nullptr) {
-            throw std::runtime_error("failed to allocate VibeVoice decoder cached step graph");
-        }
+        buffer_ = allocate_context_or_throw(
+            ctx_.get(), *runtime_, "failed to allocate VibeVoice decoder cached step graph");
         attention_mask_buffer_.assign(static_cast<size_t>(cache_tensor_steps), ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity()));
     }
 
@@ -1677,10 +1771,8 @@ public:
         ggml_build_forward_expand(graph_, logits_output_);
         constants.finish_graph();
         constants.ensure_uploaded();
-        buffer_ = ggml_backend_alloc_ctx_tensors(ctx_.get(), runtime_->backend());
-        if (buffer_ == nullptr) {
-            throw std::runtime_error("failed to allocate VibeVoice decoder cached batch graph");
-        }
+        buffer_ = allocate_context_or_throw(
+            ctx_.get(), *runtime_, "failed to allocate VibeVoice decoder cached batch graph");
         attention_mask_buffer_.assign(
             static_cast<size_t>(batch_size_ * cache_steps_),
             ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity()));
@@ -1926,8 +2018,10 @@ VibeVoiceDecoderWeightsRuntime::VibeVoiceDecoderWeightsRuntime(
     size_t weight_context_bytes,
     size_t constant_context_bytes,
     assets::TensorStorageType weight_storage_type,
-    const std::filesystem::path & runtime_lora_manifest)
+    const std::filesystem::path & runtime_lora_manifest,
+    bool disable_optional_gpu_cache)
     : assets_(std::move(assets)),
+      device_(device),
       threads_(threads) {
     if (assets_ == nullptr) {
         throw std::runtime_error("VibeVoice decoder weights runtime requires assets");
@@ -1959,7 +2053,7 @@ VibeVoiceDecoderWeightsRuntime::VibeVoiceDecoderWeightsRuntime(
     if (!runtime_lora_manifest.empty()) {
         const auto lora_started = std::chrono::steady_clock::now();
         runtime_lora_ = std::make_unique<VibeVoiceRuntimeLoraStore>(
-            *assets_, backend_, threads_, runtime_lora_manifest);
+            *assets_, backend_, device, threads_, runtime_lora_manifest, disable_optional_gpu_cache);
         engine::debug::timing_log_scalar(
             "vibevoice.runtime_lora.load_ms",
             engine::debug::elapsed_ms(lora_started));
@@ -1988,6 +2082,10 @@ const VibeVoiceDecoderWeights & VibeVoiceDecoderWeightsRuntime::weights() const 
 
 ggml_backend_t VibeVoiceDecoderWeightsRuntime::backend() const noexcept {
     return backend_;
+}
+
+int VibeVoiceDecoderWeightsRuntime::device() const noexcept {
+    return device_;
 }
 
 core::ConstantTensorCache & VibeVoiceDecoderWeightsRuntime::constants() const noexcept {
@@ -2021,6 +2119,22 @@ double VibeVoiceDecoderWeightsRuntime::activate_runtime_lora(const std::string &
 const std::string & VibeVoiceDecoderWeightsRuntime::active_runtime_lora() const noexcept {
     static const std::string empty;
     return runtime_lora_ == nullptr ? empty : runtime_lora_->active_id();
+}
+
+void VibeVoiceDecoderWeightsRuntime::release_optional_device_memory() const {
+    cached_batch_graphs_.clear();
+    prefill_graph_.reset();
+    embedding_graph_.reset();
+    if (runtime_lora_ != nullptr) {
+        runtime_lora_->release_optional_device_memory();
+    }
+    ggml_backend_synchronize(backend_);
+}
+
+void VibeVoiceDecoderWeightsRuntime::ensure_device_headroom(int64_t requested_bytes) const {
+    if (runtime_lora_ != nullptr) {
+        runtime_lora_->ensure_device_headroom(requested_bytes);
+    }
 }
 
 VibeVoiceTokenEmbeddings VibeVoiceDecoderWeightsRuntime::embed_tokens(

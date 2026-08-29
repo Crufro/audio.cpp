@@ -39,6 +39,10 @@ private:
         std::unique_ptr<engine::runtime::IVoiceTaskSession> session;
         engine::runtime::IOfflineVoiceTaskSession * offline = nullptr;
         engine::runtime::IStreamingVoiceTaskSession * streaming = nullptr;
+        std::string memory_state = "normal";
+        uint64_t targeted_recoveries = 0;
+        uint64_t model_reloads = 0;
+        std::string last_recovery_error;
         std::unordered_map<std::string, RuntimeVoicePreset> voice_presets;
         std::optional<RuntimeVoicePreset> default_voice_preset;
         // Serializes runs on this model and bounds how long a caller waits for its
@@ -59,6 +63,7 @@ private:
     LoadedModel::RuntimeVoicePreset load_runtime_voice_preset(const ServerModelConfig::VoicePreset & preset) const;
     void load_voice_presets(LoadedModel & model) const;
     void ensure_model_loaded_locked(LoadedModel & model);
+    void unload_model_locked(LoadedModel & model);
     LoadedModel & require_model(const engine::io::json::Value & body);
     const LoadedModel::RuntimeVoicePreset * select_voice_preset(
         const LoadedModel & model,
