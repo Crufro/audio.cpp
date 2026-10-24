@@ -35,6 +35,7 @@ public:
 private:
     struct ReferenceVoiceStateCacheEntry {
         std::vector<std::string> sample_paths;
+        std::vector<std::string> sample_versions;
         std::vector<runtime::AudioBuffer> audio;
         std::vector<VibeVoiceReferenceVoiceState> states;
     };

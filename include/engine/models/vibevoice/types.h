@@ -43,6 +43,7 @@ struct VibeVoiceRequest {
 struct VibeVoiceResult {
     runtime::AudioBuffer audio;
     std::vector<int32_t> generated_tokens;
+    bool output_limited = false;
 };
 
 }  // namespace engine::models::vibevoice

@@ -1,11 +1,13 @@
 #include "engine/models/vibevoice/generator.h"
 
+#include "engine/framework/debug/profiler.h"
 #include "engine/framework/debug/trace.h"
 #include "engine/framework/io/binary.h"
 #include "engine/framework/sampling/torch_random.h"
 #include "engine/models/vibevoice/diffusion_sampler.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <iostream>
@@ -16,6 +18,53 @@
 
 namespace engine::models::vibevoice {
 namespace {
+
+using Clock = std::chrono::steady_clock;
+
+struct VibeVoiceGenerationTiming {
+    double prompt_prepare_ms = 0.0;
+    double positive_prefill_ms = 0.0;
+    double negative_prefill_ms = 0.0;
+    double token_select_ms = 0.0;
+    double token_embedding_ms = 0.0;
+    double diffusion_noise_ms = 0.0;
+    double diffusion_ms = 0.0;
+    double acoustic_decode_ms = 0.0;
+    double audio_append_ms = 0.0;
+    double semantic_encode_ms = 0.0;
+    double acoustic_connector_ms = 0.0;
+    double semantic_connector_ms = 0.0;
+    double embedding_combine_ms = 0.0;
+    double negative_decode_ms = 0.0;
+    double positive_decode_ms = 0.0;
+    int64_t generated_tokens = 0;
+    int64_t diffusion_tokens = 0;
+    int64_t speech_start_tokens = 0;
+    int64_t speech_end_tokens = 0;
+
+    void log(double total_ms) const {
+        engine::debug::timing_log_scalar("vibevoice.phase.prompt_prepare_ms", prompt_prepare_ms);
+        engine::debug::timing_log_scalar("vibevoice.phase.positive_prefill_ms", positive_prefill_ms);
+        engine::debug::timing_log_scalar("vibevoice.phase.negative_prefill_ms", negative_prefill_ms);
+        engine::debug::timing_log_scalar("vibevoice.phase.token_select_ms", token_select_ms);
+        engine::debug::timing_log_scalar("vibevoice.phase.token_embedding_ms", token_embedding_ms);
+        engine::debug::timing_log_scalar("vibevoice.phase.diffusion_noise_ms", diffusion_noise_ms);
+        engine::debug::timing_log_scalar("vibevoice.phase.diffusion_ms", diffusion_ms);
+        engine::debug::timing_log_scalar("vibevoice.phase.acoustic_decode_ms", acoustic_decode_ms);
+        engine::debug::timing_log_scalar("vibevoice.phase.audio_append_ms", audio_append_ms);
+        engine::debug::timing_log_scalar("vibevoice.phase.semantic_encode_ms", semantic_encode_ms);
+        engine::debug::timing_log_scalar("vibevoice.phase.acoustic_connector_ms", acoustic_connector_ms);
+        engine::debug::timing_log_scalar("vibevoice.phase.semantic_connector_ms", semantic_connector_ms);
+        engine::debug::timing_log_scalar("vibevoice.phase.embedding_combine_ms", embedding_combine_ms);
+        engine::debug::timing_log_scalar("vibevoice.phase.negative_decode_ms", negative_decode_ms);
+        engine::debug::timing_log_scalar("vibevoice.phase.positive_decode_ms", positive_decode_ms);
+        engine::debug::timing_log_scalar("vibevoice.phase.generated_tokens", generated_tokens);
+        engine::debug::timing_log_scalar("vibevoice.phase.diffusion_tokens", diffusion_tokens);
+        engine::debug::timing_log_scalar("vibevoice.phase.speech_start_tokens", speech_start_tokens);
+        engine::debug::timing_log_scalar("vibevoice.phase.speech_end_tokens", speech_end_tokens);
+        engine::debug::timing_log_scalar("vibevoice.phase.total_ms", total_ms);
+    }
+};
 
 int64_t count_speech_mask_positions(const VibeVoicePromptEncoding & encoding) {
     return static_cast<int64_t>(
@@ -531,8 +580,11 @@ VibeVoiceResult generate_vibevoice(
     const VibeVoiceDiffusionHeadWeightsRuntime & diffusion_head,
     VibeVoiceDecoderCachedState & positive_cache,
     VibeVoiceDecoderCachedState & negative_cache) {
+    const auto generation_started = Clock::now();
+    VibeVoiceGenerationTiming timing;
     const auto & config = decoder.assets().config.decoder;
     const auto prompt_noise_values = load_noise_file(request.generation.prompt_noise_file, "prompt");
+    auto phase_started = Clock::now();
     auto prompt = prepare_vibevoice_prompt(
         request,
         text_tokenizer,
@@ -542,14 +594,23 @@ VibeVoiceResult generate_vibevoice(
         request.generation.seed,
         0,
         prompt_noise_values.empty() ? nullptr : &prompt_noise_values);
+    timing.prompt_prepare_ms += engine::debug::elapsed_ms(phase_started);
+    audio_tokenizer.release_prompt_graphs();
     const int64_t max_steps = max_generation_steps(prompt, request.generation, config);
     engine::debug::timing_log_scalar("vibevoice.generate.max_steps", max_steps);
     engine::debug::timing_log_scalar("vibevoice.generate.prompt_steps", prompt.steps);
+    phase_started = Clock::now();
     auto positive = decoder.prefill_embeddings(prompt.embeddings, prompt.steps);
+    timing.positive_prefill_ms += engine::debug::elapsed_ms(phase_started);
     decoder.reset_cached_state(positive_cache, std::move(positive.state));
+    phase_started = Clock::now();
     auto negative_start = single_token_embedding(decoder, text_tokenizer.speech_start_id(), prompt.hidden_size);
+    timing.token_embedding_ms += engine::debug::elapsed_ms(phase_started);
+    phase_started = Clock::now();
     auto negative = decoder.prefill_embeddings(negative_start, 1);
+    timing.negative_prefill_ms += engine::debug::elapsed_ms(phase_started);
     decoder.reset_cached_state(negative_cache, std::move(negative.state));
+    decoder.release_prompt_graphs();
     const int64_t latent_size = audio_tokenizer.assets().config.diffusion_head.latent_size;
     if (latent_size != audio_tokenizer.assets().config.acoustic_vae_dim) {
         throw std::runtime_error("VibeVoice generation latent size mismatch");
@@ -568,27 +629,37 @@ VibeVoiceResult generate_vibevoice(
 
     auto current = std::move(positive.result);
     for (int64_t step = 0; step < max_steps; ++step) {
+        phase_started = Clock::now();
         const int32_t token = select_vibevoice_constrained_token(
             current.logits,
             text_tokenizer,
             request.generation,
             sampler_rng);
+        timing.token_select_ms += engine::debug::elapsed_ms(phase_started);
         generated_tokens.push_back(token);
+        ++timing.generated_tokens;
         if (token == text_tokenizer.eos_id()) {
             break;
         }
         if (token == text_tokenizer.speech_start_id()) {
+            ++timing.speech_start_tokens;
+            phase_started = Clock::now();
             negative = decoder.prefill_embeddings(negative_start, 1);
+            timing.negative_prefill_ms += engine::debug::elapsed_ms(phase_started);
             decoder.reset_cached_state(negative_cache, std::move(negative.state));
+            decoder.release_prompt_graphs();
         }
         if (token == text_tokenizer.speech_end_id()) {
+            ++timing.speech_end_tokens;
             acoustic_streaming_state.set_to_zero();
             semantic_streaming_state.set_to_zero();
         }
 
         std::vector<float> next_embedding;
         if (token == text_tokenizer.speech_diffusion_id()) {
+            ++timing.diffusion_tokens;
             const size_t noise_count = static_cast<size_t>(2 * latent_size);
+            phase_started = Clock::now();
             auto initial_noise = next_diffusion_noise(
                 noise_file_values,
                 noise_file_offset,
@@ -596,6 +667,7 @@ VibeVoiceResult generate_vibevoice(
                 request.generation.seed,
                 diffusion_rng_index,
                 sampling::TorchRandnPrecision::BFloat16);
+            timing.diffusion_noise_ms += engine::debug::elapsed_ms(phase_started);
             VibeVoiceSpeechDiffusionInput diffusion_input;
             diffusion_input.positive_condition = current.last_hidden.values;
             diffusion_input.negative_condition = negative.result.last_hidden.values;
@@ -605,7 +677,9 @@ VibeVoiceResult generate_vibevoice(
             diffusion_input.latent_size = latent_size;
             diffusion_input.inference_steps = request.generation.num_inference_steps;
             diffusion_input.guidance_scale = request.generation.guidance_scale;
+            phase_started = Clock::now();
             auto speech_latents = sample_vibevoice_speech_latents(diffusion_head, diffusion_scheduler, diffusion_input);
+            timing.diffusion_ms += engine::debug::elapsed_ms(phase_started);
             if (speech_latents.size() != 1) {
                 throw std::runtime_error("VibeVoice diffusion sampler returned unexpected batch size");
             }
@@ -614,35 +688,53 @@ VibeVoiceResult generate_vibevoice(
                 speech_latents.front(),
                 audio_tokenizer.assets().speech_scaling_factor,
                 audio_tokenizer.assets().speech_bias_factor);
+            phase_started = Clock::now();
             auto chunk = audio_tokenizer.decode_acoustic_streaming(decoder_latents, acoustic_streaming_state);
+            timing.acoustic_decode_ms += engine::debug::elapsed_ms(phase_started);
+            phase_started = Clock::now();
             append_audio(audio_samples, chunk);
+            timing.audio_append_ms += engine::debug::elapsed_ms(phase_started);
+            phase_started = Clock::now();
             auto semantic_features = audio_tokenizer.encode_semantic_streaming(chunk, semantic_streaming_state);
+            timing.semantic_encode_ms += engine::debug::elapsed_ms(phase_started);
+            phase_started = Clock::now();
             auto acoustic_embedding = connector.project_acoustic(
                 speech_latents.front().values,
                 speech_latents.front().frames,
                 speech_latents.front().dim);
+            timing.acoustic_connector_ms += engine::debug::elapsed_ms(phase_started);
+            phase_started = Clock::now();
             auto semantic_embedding = connector.project_semantic(
                 semantic_features.values,
                 semantic_features.frames,
                 semantic_features.dim);
+            timing.semantic_connector_ms += engine::debug::elapsed_ms(phase_started);
+            phase_started = Clock::now();
             next_embedding = add_embeddings(acoustic_embedding, semantic_embedding);
+            timing.embedding_combine_ms += engine::debug::elapsed_ms(phase_started);
             if (static_cast<int64_t>(next_embedding.size()) != prompt.hidden_size) {
                 throw std::runtime_error("VibeVoice generated diffusion embedding shape mismatch");
             }
         } else {
+            phase_started = Clock::now();
             next_embedding = single_token_embedding(decoder, token, prompt.hidden_size);
+            timing.token_embedding_ms += engine::debug::elapsed_ms(phase_started);
         }
 
         if (token == text_tokenizer.speech_diffusion_id()) {
+            phase_started = Clock::now();
             negative.result = decoder.cached_step(
                 next_embedding,
                 negative_cache,
                 1);
+            timing.negative_decode_ms += engine::debug::elapsed_ms(phase_started);
         }
+        phase_started = Clock::now();
         current = decoder.cached_step(
             next_embedding,
             positive_cache,
             prompt.steps + step + 1);
+        timing.positive_decode_ms += engine::debug::elapsed_ms(phase_started);
     }
 
     if (audio_samples.empty()) {
@@ -651,7 +743,9 @@ VibeVoiceResult generate_vibevoice(
 
     VibeVoiceResult out;
     out.audio = runtime::AudioBuffer{24000, 1, std::move(audio_samples)};
+    out.output_limited = generated_tokens.empty() || generated_tokens.back() != text_tokenizer.eos_id();
     out.generated_tokens = std::move(generated_tokens);
+    timing.log(engine::debug::elapsed_ms(generation_started));
     return out;
 }
 
@@ -730,6 +824,7 @@ std::vector<VibeVoiceResult> generate_vibevoice_batch(
         first_options.seed,
         0,
         prompt_noise_values.empty() ? nullptr : &prompt_noise_values);
+    audio_tokenizer.release_prompt_graphs();
     uint64_t prompt_rng_index = prompts.front().next_rng_index;
     const int64_t prompt_steps = prompts.front().steps;
     std::vector<std::vector<float>> prompt_embeddings;
@@ -768,6 +863,7 @@ std::vector<VibeVoiceResult> generate_vibevoice_batch(
 
     const auto negative_start = single_token_embedding(decoder, text_tokenizer.speech_start_id(), hidden_size);
     const auto negative_template = decoder.prefill_embeddings(negative_start, 1);
+    decoder.release_prompt_graphs();
     for (auto & state : states) {
         state.negative = negative_template.result;
         decoder.reset_cached_state(state.negative_cache, negative_template.state);
@@ -819,6 +915,7 @@ std::vector<VibeVoiceResult> generate_vibevoice_batch(
             if (token == text_tokenizer.speech_start_id()) {
                 state.negative = negative_template.result;
                 decoder.reset_cached_state(state.negative_cache, negative_template.state);
+                decoder.release_prompt_graphs();
             }
             if (token == text_tokenizer.speech_end_id()) {
                 state.acoustic_streaming_state.set_to_zero();

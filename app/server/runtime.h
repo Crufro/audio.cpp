@@ -39,10 +39,27 @@ private:
         std::unique_ptr<engine::runtime::IVoiceTaskSession> session;
         engine::runtime::IOfflineVoiceTaskSession * offline = nullptr;
         engine::runtime::IStreamingVoiceTaskSession * streaming = nullptr;
+        mutable std::mutex status_mutex;
         std::string memory_state = "normal";
-        uint64_t targeted_recoveries = 0;
-        uint64_t model_reloads = 0;
+        std::atomic<uint64_t> targeted_recoveries{0};
+        std::atomic<uint64_t> model_reloads{0};
         std::string last_recovery_error;
+        std::string get_memory_state() const {
+            std::lock_guard<std::mutex> lock(status_mutex);
+            return memory_state;
+        }
+        void set_memory_state(const std::string & value) {
+            std::lock_guard<std::mutex> lock(status_mutex);
+            memory_state = value;
+        }
+        std::string get_last_recovery_error() const {
+            std::lock_guard<std::mutex> lock(status_mutex);
+            return last_recovery_error;
+        }
+        void set_last_recovery_error(const std::string & value) {
+            std::lock_guard<std::mutex> lock(status_mutex);
+            last_recovery_error = value;
+        }
         std::unordered_map<std::string, RuntimeVoicePreset> voice_presets;
         std::optional<RuntimeVoicePreset> default_voice_preset;
         // Serializes runs on this model and bounds how long a caller waits for its

@@ -18,6 +18,7 @@
 #include "engine/framework/core/constant_tensor_cache.h"
 
 #include <ggml-backend.h>
+#include <ggml-alloc.h>
 #include <ggml.h>
 
 #include <algorithm>
@@ -35,16 +36,9 @@ namespace engine::models::vibevoice {
 namespace {
 
 int64_t estimate_context_allocation_bytes(ggml_context * ctx, ggml_backend_t backend) {
-    const auto buft = ggml_backend_get_default_buffer_type(backend);
-    const size_t alignment = ggml_backend_buft_get_alignment(buft);
-    int64_t total = 0;
-    for (ggml_tensor * tensor = ggml_get_first_tensor(ctx);
-         tensor != nullptr;
-         tensor = ggml_get_next_tensor(ctx, tensor)) {
-        total += static_cast<int64_t>(GGML_PAD(
-            ggml_backend_buft_get_alloc_size(buft, tensor), alignment));
-    }
-    return total;
+    // Use the allocator's own accounting; views/already-backed tensors are free.
+    return static_cast<int64_t>(ggml_backend_alloc_ctx_tensors_from_buft_size(
+        ctx, ggml_backend_get_default_buffer_type(backend)));
 }
 
 ggml_backend_buffer_t allocate_context_or_throw(
@@ -65,10 +59,15 @@ ggml_backend_buffer_t allocate_context_or_throw(
 
 namespace binding = modules::binding;
 
-constexpr int64_t kGroupedCachedAttentionMinSteps = 4096;
 constexpr int64_t kScratchTailCachedAttentionMinSteps = 32768;
 constexpr int64_t kLargeCacheGrowthStep = 2048;
-constexpr int64_t kLayerwisePrefillMinSteps = 2048;
+// Building all decoder layers into one prefill graph has a steep temporary
+// VRAM cost well before prompts become "long" in model terms.  In particular,
+// cloned-voice prompts include reference-audio tokens and can exhaust a 24 GiB
+// device at roughly 300 steps while the layerwise path remains comfortably
+// bounded.  Prefer the layerwise graph once that tradeoff becomes relevant.
+constexpr int64_t kLayerwisePrefillMinSteps = 256;
+constexpr ggml_type kDecoderCacheType = GGML_TYPE_F16;
 
 struct GgmlContextDeleter {
     void operator()(ggml_context * ctx) const noexcept {
@@ -185,32 +184,6 @@ core::TensorValue attention_from_heads(
         attn = core::wrap_tensor(ggml_soft_max(ctx.ggml, scores.tensor), scores.shape, GGML_TYPE_F32);
     }
     return matmul.build(ctx, attn, v_heads);
-}
-
-core::TensorValue attention_from_grouped_query_heads(
-    core::ModuleBuildContext & ctx,
-    const core::TensorValue & q_heads,
-    const core::TensorValue & k_heads,
-    const core::TensorValue & v_heads,
-    int64_t dim,
-    int64_t attention_heads,
-    int64_t key_value_heads,
-    const core::TensorValue & attention_mask) {
-    const int64_t repeats = attention_heads / key_value_heads;
-    std::vector<core::TensorValue> head_outputs;
-    head_outputs.reserve(static_cast<size_t>(attention_heads));
-    for (int64_t head = 0; head < attention_heads; ++head) {
-        const int64_t key_value_head = head / repeats;
-        auto q_head = modules::SliceModule({1, head, 1}).build(ctx, q_heads);
-        auto k_head = modules::SliceModule({1, key_value_head, 1}).build(ctx, k_heads);
-        auto v_head = modules::SliceModule({1, key_value_head, 1}).build(ctx, v_heads);
-        head_outputs.push_back(attention_from_heads(ctx, q_head, k_head, v_head, dim, attention_mask));
-    }
-    auto output = head_outputs.front();
-    for (size_t i = 1; i < head_outputs.size(); ++i) {
-        output = modules::ConcatModule({1}).build(ctx, output, head_outputs[i]);
-    }
-    return output;
 }
 
 core::TensorValue flash_attention_from_grouped_heads_view_kv(
@@ -532,6 +505,12 @@ public:
 
     void ensure_device_headroom(int64_t requested_bytes) {
         trim_to_reserve(std::max<int64_t>(0, requested_bytes));
+        const auto memory = core::query_backend_memory(backend_, device_);
+        if (requested_bytes > 0 && memory.available &&
+            memory.free_bytes < effective_reserve(memory) + requested_bytes) {
+            throw core::BackendAllocationError(
+                "VibeVoice decoder allocation would breach VRAM reserve", requested_bytes, memory);
+        }
     }
 
 private:
@@ -1519,11 +1498,11 @@ public:
             const auto & layer = runtime_->weights().layers[layer_index];
             cache_keys.push_back(core::make_tensor(
                 ctx,
-                GGML_TYPE_F32,
+                runtime_->cache_type(),
                 core::TensorShape::from_dims({1, cache_tensor_steps, config.num_key_value_heads, head_dim})));
             cache_values.push_back(core::make_tensor(
                 ctx,
-                GGML_TYPE_F32,
+                runtime_->cache_type(),
                 core::TensorShape::from_dims({1, cache_tensor_steps, config.num_key_value_heads, head_dim})));
             auto layer_out = scratch_tail_
                 ? build_vibevoice_decoder_layer_scratch_tail(
@@ -1556,11 +1535,15 @@ public:
                 value_sources_.push_back(ggml_view_1d(ctx_.get(), layer_out.value.tensor, config.num_key_value_heads * head_dim, 0));
             }
         }
+        runtime::TransformerKVCacheOptions cache_options;
+        cache_options.allow_f16_storage = runtime_->cache_type() == GGML_TYPE_F16;
+        cache_options.allow_bf16_storage = runtime_->cache_type() == GGML_TYPE_BF16;
         cache_ = runtime::TransformerKVCache(
             cache_tensor_steps,
             config.num_key_value_heads * head_dim,
             std::move(cache_keys),
-            std::move(cache_values));
+            std::move(cache_values),
+            cache_options);
         if (scratch_tail_) {
             build_transfer_views(config.num_key_value_heads * head_dim);
         }
@@ -1665,7 +1648,8 @@ private:
         key_destinations_.assign(static_cast<size_t>(cache_steps_), {});
         value_destinations_.assign(static_cast<size_t>(cache_steps_), {});
         for (int64_t slot = 0; slot < cache_steps_; ++slot) {
-            const size_t byte_offset = static_cast<size_t>(slot * step_elems) * sizeof(float);
+            const size_t byte_offset = static_cast<size_t>(slot * step_elems) *
+                ggml_type_size(cache_.key_tensor(0).type);
             auto & key_slot = key_destinations_[static_cast<size_t>(slot)];
             auto & value_slot = value_destinations_[static_cast<size_t>(slot)];
             key_slot.reserve(key_sources_.size());
@@ -1740,11 +1724,11 @@ public:
             const auto & layer = runtime_->weights().layers[layer_index];
             cache_keys_.push_back(core::make_tensor(
                 ctx,
-                GGML_TYPE_F32,
+                runtime_->cache_type(),
                 core::TensorShape::from_dims({batch_size_, cache_steps_, config.num_key_value_heads, head_dim})));
             cache_values_.push_back(core::make_tensor(
                 ctx,
-                GGML_TYPE_F32,
+                runtime_->cache_type(),
                 core::TensorShape::from_dims({batch_size_, cache_steps_, config.num_key_value_heads, head_dim})));
             auto layer_out = build_vibevoice_decoder_layer_static_tail(
                 ctx,
@@ -1859,8 +1843,16 @@ public:
                 std::copy(layer_state.key.begin(), layer_state.key.end(), key_values.begin() + offset);
                 std::copy(layer_state.value.begin(), layer_state.value.end(), value_values.begin() + offset);
             }
-            core::write_tensor_f32(cache_keys_[layer], key_values);
-            core::write_tensor_f32(cache_values_[layer], value_values);
+            if (runtime_->cache_type() == GGML_TYPE_F16) {
+                core::write_tensor_f16(cache_keys_[layer], key_values);
+                core::write_tensor_f16(cache_values_[layer], value_values);
+            } else if (runtime_->cache_type() == GGML_TYPE_BF16) {
+                core::write_tensor_bf16(cache_keys_[layer], key_values);
+                core::write_tensor_bf16(cache_values_[layer], value_values);
+            } else {
+                core::write_tensor_f32(cache_keys_[layer], key_values);
+                core::write_tensor_f32(cache_values_[layer], value_values);
+            }
         }
 
         for (int64_t batch = 0; batch < batch_size_; ++batch) {
@@ -1962,8 +1954,18 @@ public:
             }
         }
         for (size_t layer = 0; layer < cache_keys_.size(); ++layer) {
-            const auto key_values = core::read_tensor_f32(cache_keys_[layer].tensor);
-            const auto value_values = core::read_tensor_f32(cache_values_[layer].tensor);
+            std::vector<float> key_values;
+            std::vector<float> value_values;
+            if (runtime_->cache_type() == GGML_TYPE_F16) {
+                key_values = core::read_tensor_f16(cache_keys_[layer].tensor);
+                value_values = core::read_tensor_f16(cache_values_[layer].tensor);
+            } else if (runtime_->cache_type() == GGML_TYPE_BF16) {
+                key_values = core::read_tensor_bf16(cache_keys_[layer].tensor);
+                value_values = core::read_tensor_bf16(cache_values_[layer].tensor);
+            } else {
+                key_values = core::read_tensor_f32(cache_keys_[layer].tensor);
+                value_values = core::read_tensor_f32(cache_values_[layer].tensor);
+            }
             for (int64_t batch = 0; batch < batch_size_; ++batch) {
                 const size_t offset = static_cast<size_t>(batch) * sample_cache_elems;
                 auto & layer_state = outputs[static_cast<size_t>(batch)].layers[layer];
@@ -2021,6 +2023,7 @@ VibeVoiceDecoderWeightsRuntime::VibeVoiceDecoderWeightsRuntime(
     const std::filesystem::path & runtime_lora_manifest,
     bool disable_optional_gpu_cache)
     : assets_(std::move(assets)),
+      cache_type_(kDecoderCacheType),
       device_(device),
       threads_(threads) {
     if (assets_ == nullptr) {
@@ -2090,6 +2093,10 @@ int VibeVoiceDecoderWeightsRuntime::device() const noexcept {
 
 core::ConstantTensorCache & VibeVoiceDecoderWeightsRuntime::constants() const noexcept {
     return *constants_;
+}
+
+ggml_type VibeVoiceDecoderWeightsRuntime::cache_type() const noexcept {
+    return cache_type_;
 }
 
 int VibeVoiceDecoderWeightsRuntime::threads() const noexcept {
@@ -2200,6 +2207,11 @@ std::vector<VibeVoiceDecoderPrefillOutput> VibeVoiceDecoderWeightsRuntime::prefi
             1024ull * 1024ull * 1024ull);
     }
     return prefill_graph_->run_batch(embeddings);
+}
+
+void VibeVoiceDecoderWeightsRuntime::release_prompt_graphs() const {
+    prefill_graph_.reset();
+    embedding_graph_.reset();
 }
 
 VibeVoiceDecoderCachedBatchStepGraph * VibeVoiceDecoderWeightsRuntime::find_cached_batch_graph(
@@ -2476,7 +2488,6 @@ VibeVoiceDecoderLayerOutputs build_vibevoice_decoder_layer_static_tail(
     const core::TensorValue & cache_slot,
     const core::TensorValue & attention_mask) {
     const int64_t dim = require_head_dim(config);
-    const int64_t kv_repeats = config.num_attention_heads / config.num_key_value_heads;
     const modules::LinearModule q_proj(
         binding::linear_config(config.hidden_size, config.num_attention_heads * dim, true));
     const modules::LinearModule k_proj(
@@ -2509,7 +2520,10 @@ VibeVoiceDecoderLayerOutputs build_vibevoice_decoder_layer_static_tail(
     k = core::ensure_backend_addressable_layout(ctx, k);
     v = core::ensure_backend_addressable_layout(ctx, v);
 
-    const modules::FastKVSetRowsModule set_rows;
+    const modules::FastKVSetRowsModule set_rows(
+        cache_key.type == GGML_TYPE_F32
+            ? modules::FastKVSetRowsConfig{}
+            : modules::FastKVSetRowsConfig{modules::FastKVSetRowsMode::BackendViewOptimized});
     auto updated_cache_key = set_rows.build(ctx, cache_key, k, cache_slot);
     auto updated_cache_value = set_rows.build(ctx, cache_value, v, cache_slot);
 
@@ -2517,26 +2531,13 @@ VibeVoiceDecoderLayerOutputs build_vibevoice_decoder_layer_static_tail(
     q_heads = core::wrap_tensor(ggml_cont(ctx.ggml, q_heads.tensor), q_heads.shape, q_heads.type);
     auto k_heads = modules::TransposeModule({{0, 2, 1, 3}, updated_cache_key.shape.rank}).build(ctx, updated_cache_key);
     auto v_heads = modules::TransposeModule({{0, 2, 1, 3}, updated_cache_value.shape.rank}).build(ctx, updated_cache_value);
-    core::TensorValue context;
-    if (updated_cache_key.shape.dims[1] >= kGroupedCachedAttentionMinSteps && kv_repeats > 1) {
-        k_heads = core::ensure_backend_addressable_layout(ctx, k_heads);
-        v_heads = core::ensure_backend_addressable_layout(ctx, v_heads);
-        context = attention_from_grouped_query_heads(
-            ctx,
-            q_heads,
-            k_heads,
-            v_heads,
-            dim,
-            config.num_attention_heads,
-            config.num_key_value_heads,
-            attention_mask);
-    } else {
-        k_heads = repeat_kv_heads(ctx, k_heads, kv_repeats);
-        v_heads = repeat_kv_heads(ctx, v_heads, kv_repeats);
-        k_heads = core::wrap_tensor(ggml_cont(ctx.ggml, k_heads.tensor), k_heads.shape, k_heads.type);
-        v_heads = core::wrap_tensor(ggml_cont(ctx.ggml, v_heads.tensor), v_heads.shape, v_heads.type);
-        context = attention_from_heads(ctx, q_heads, k_heads, v_heads, dim, attention_mask);
-    }
+    auto context = flash_attention_from_grouped_heads_view_kv(
+        ctx,
+        q_heads,
+        k_heads,
+        v_heads,
+        dim,
+        attention_mask);
     context = modules::TransposeModule({{0, 2, 1, 3}, context.shape.rank}).build(ctx, context);
     context = core::ensure_backend_addressable_layout(ctx, context);
     context = core::reshape_tensor(

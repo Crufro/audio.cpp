@@ -175,6 +175,8 @@ struct VoiceActivityEvent {
 };
 
 struct TaskResult {
+    int64_t generated_tokens = 0;
+    bool output_limited = false;
     std::optional<AudioBuffer> audio_output = std::nullopt;
     std::vector<NamedAudioBuffer> named_audio_outputs;
     std::optional<Transcript> text_output = std::nullopt;

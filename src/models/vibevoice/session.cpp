@@ -301,8 +301,15 @@ runtime::TaskResult VibeVoiceSession::run(const runtime::TaskRequest & request) 
     const auto wall_start = Clock::now();
     const std::string adapter_id =
         runtime::find_option(request.options, {"vibevoice.adapter_id"}).value_or("");
+    auto phase_start = Clock::now();
     decoder_.activate_runtime_lora(adapter_id);
+    engine::debug::timing_log_scalar(
+        "vibevoice.session.adapter_activate_ms", engine::debug::elapsed_ms(phase_start));
+    phase_start = Clock::now();
     auto vibevoice_request = make_request(request);
+    engine::debug::timing_log_scalar(
+        "vibevoice.session.request_prepare_ms", engine::debug::elapsed_ms(phase_start));
+    phase_start = Clock::now();
     auto result = generate_vibevoice(
         vibevoice_request,
         text_tokenizer_,
@@ -312,9 +319,19 @@ runtime::TaskResult VibeVoiceSession::run(const runtime::TaskRequest & request) 
         diffusion_head_,
         positive_decoder_cache_,
         negative_decoder_cache_);
+    engine::debug::timing_log_scalar(
+        "vibevoice.session.generate_ms", engine::debug::elapsed_ms(phase_start));
+    phase_start = Clock::now();
     decoder_.ensure_device_headroom(0);
+    engine::debug::timing_log_scalar(
+        "vibevoice.session.headroom_ms", engine::debug::elapsed_ms(phase_start));
+    phase_start = Clock::now();
     runtime::TaskResult out;
+    out.generated_tokens = static_cast<int64_t>(result.generated_tokens.size());
+    out.output_limited = result.output_limited;
     out.audio_output = std::move(result.audio);
+    engine::debug::timing_log_scalar(
+        "vibevoice.session.result_assemble_ms", engine::debug::elapsed_ms(phase_start));
     engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(wall_start));
     return out;
 }
@@ -323,6 +340,7 @@ void VibeVoiceSession::release_optional_device_memory() {
     positive_decoder_cache_ = VibeVoiceDecoderCachedState{};
     negative_decoder_cache_ = VibeVoiceDecoderCachedState{};
     decoder_.release_optional_device_memory();
+    audio_tokenizer_.release_prompt_graphs();
 }
 
 VibeVoiceRequest VibeVoiceSession::make_request(const runtime::TaskRequest & request) const {
@@ -374,12 +392,17 @@ std::vector<VibeVoiceSpeakerPrompt> VibeVoiceSession::resolve_voice_sample_promp
         }
         return total;
     };
+    std::vector<std::string> sample_versions;
+    for (const auto & path : sample_paths) {
+        sample_versions.push_back(std::to_string(std::filesystem::file_size(path)) + ":" +
+            std::to_string(std::filesystem::last_write_time(path).time_since_epoch().count()));
+    }
     int64_t cache_evictions = 0;
     const auto found = std::find_if(
         reference_voice_state_cache_.begin(),
         reference_voice_state_cache_.end(),
         [&](const ReferenceVoiceStateCacheEntry & entry) {
-            return entry.sample_paths == sample_paths;
+            return entry.sample_paths == sample_paths && entry.sample_versions == sample_versions;
         });
     if (found != reference_voice_state_cache_.end()) {
         std::vector<VibeVoiceSpeakerPrompt> prompts;
@@ -417,6 +440,7 @@ std::vector<VibeVoiceSpeakerPrompt> VibeVoiceSession::resolve_voice_sample_promp
 
     ReferenceVoiceStateCacheEntry entry;
     entry.sample_paths = sample_paths;
+    entry.sample_versions = sample_versions;
     entry.audio = audio;
     entry.states.reserve(acoustic_means.size());
     std::vector<VibeVoiceSpeakerPrompt> prompts;
